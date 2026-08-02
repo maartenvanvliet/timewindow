@@ -109,7 +109,7 @@ Two `KEY=value` lines on stdout, ready to be redirected into `$GITHUB_OUTPUT`:
 
 ```
 allowed=true|false
-reason=<name of the deciding rule | "manual override" | "no rule matched">
+reason=<name of the deciding rule | "no rule matched">
 ```
 
 Exit codes:
@@ -127,10 +127,8 @@ has no action or an unknown one, when a rule defines no intervals (it could
 never match), when two rules share a name, and when `action` is written one
 level too deep, under a `time_intervals` entry instead of on the rule.
 
-Set `DEPLOY_GATE_OVERRIDE` to force a deploy past the rules. Any value other
-than empty, `0`, `false` or `no` (case-insensitive) counts as set; the config is
-not even read in that case, and the tool prints `allowed=true` /
-`reason=manual override`.
+There is no override flag or env var: the tool only answers the question. If
+you want a break-glass path, skip the call in the shell — see below.
 
 ## Install
 
@@ -206,6 +204,40 @@ Then gate the deploy job on the step output:
 Pin the version in the URL rather than tracking `latest`, so a new release
 cannot change a deploy decision without a commit to your workflow.
 
+### Break-glass
+
+Overrides belong to the caller, not the gate. To let a human force a deploy,
+take a `workflow_dispatch` input and skip the check:
+
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Deploy even outside the window
+        type: boolean
+        default: false
+```
+
+```yaml
+- id: check
+  env:
+    FORCE: ${{ inputs.force }}
+  run: |
+    if [ "$FORCE" = "true" ]; then
+      printf 'allowed=true\nreason=manual override\n' >> "$GITHUB_OUTPUT"
+      exit 0
+    fi
+    set +e
+    ./deploy-gate >> "$GITHUB_OUTPUT"
+    code=$?
+    [ "$code" -le 1 ] || exit "$code"
+```
+
+That keeps the override where it can be seen and audited — in the workflow
+run's inputs — instead of in an environment variable that anything on the
+runner could have set.
+
 In a repo that already vendors this tool, you can skip the download:
 
 ```yaml
@@ -251,8 +283,7 @@ go test ./...
 ```
 
 Table-driven cases cover office hours, the Friday cutoff, the weekend, both
-halves of the Christmas freeze, the DST switch, the override env var, and the
-engine itself: a later deny beating an earlier allow, the same two rules
+halves of the Christmas freeze, the DST switch, and the engine itself: a later deny beating an earlier allow, the same two rules
 swapped producing the opposite outcome, an allow punching a hole in an earlier
 deny, the always-matching empty interval, and both defaults. Config errors are
 covered by their own table — malformed YAML, the pre-rules schema, a bad

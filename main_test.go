@@ -132,7 +132,6 @@ func TestEvaluate(t *testing.T) {
 		name       string
 		config     string
 		now        string // wall clock in Europe/Amsterdam
-		override   string
 		wantAllow  bool
 		wantReason string
 	}{
@@ -199,23 +198,6 @@ func TestEvaluate(t *testing.T) {
 			wantAllow:  true,
 			wantReason: "office-hours",
 		},
-		{
-			name:       "override wins over a denying rule",
-			config:     officeConfig,
-			now:        "2026-12-23 10:00",
-			override:   "true",
-			wantAllow:  true,
-			wantReason: "manual override",
-		},
-		{
-			name:       "falsey override does not force a deploy",
-			config:     officeConfig,
-			now:        "2026-12-23 10:00",
-			override:   "false",
-			wantAllow:  false,
-			wantReason: "christmas-freeze",
-		},
-
 		// Last match wins.
 		{
 			name:       "later deny beats an earlier allow",
@@ -310,7 +292,7 @@ rules:
 		t.Run(tc.name, func(t *testing.T) {
 			path := writeConfig(t, tc.config)
 
-			got, err := Evaluate(path, amsterdam(t, tc.now), tc.override)
+			got, err := Evaluate(path, amsterdam(t, tc.now))
 			if err != nil {
 				t.Fatalf("Evaluate() error = %v", err)
 			}
@@ -434,7 +416,7 @@ rules:
 		t.Run(tc.name, func(t *testing.T) {
 			path := writeConfig(t, tc.config)
 
-			got, err := Evaluate(path, time.Now(), "")
+			got, err := Evaluate(path, time.Now())
 			if err == nil {
 				t.Fatalf("Evaluate() = %+v, want error", got)
 			}
@@ -448,21 +430,9 @@ rules:
 // TestEvaluateMissingConfig covers the "broken config" path when the file does
 // not exist at all: it must error rather than allow.
 func TestEvaluateMissingConfig(t *testing.T) {
-	_, err := Evaluate(filepath.Join(t.TempDir(), "absent.yml"), time.Now(), "")
+	_, err := Evaluate(filepath.Join(t.TempDir(), "absent.yml"), time.Now())
 	if err == nil {
 		t.Fatal("Evaluate() with a missing config = nil error, want an error")
-	}
-}
-
-// TestEvaluateOverrideSkipsConfig documents that an override does not require a
-// readable config: the gate is bypassed entirely.
-func TestEvaluateOverrideSkipsConfig(t *testing.T) {
-	got, err := Evaluate(filepath.Join(t.TempDir(), "absent.yml"), time.Now(), "1")
-	if err != nil {
-		t.Fatalf("Evaluate() error = %v", err)
-	}
-	if !got.Allowed || got.Reason != "manual override" {
-		t.Errorf("Evaluate() = %+v, want an allowed manual override", got)
 	}
 }
 
@@ -584,26 +554,6 @@ func TestBuildInfoString(t *testing.T) {
 	for _, want := range []string{"deploy-gate dev", "commit: unknown-dirty", "built:  unknown"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("String() = %q, want it to contain %q", got, want)
-		}
-	}
-}
-
-func TestOverrideRequested(t *testing.T) {
-	tests := map[string]bool{
-		"":      false,
-		" ":     false,
-		"0":     false,
-		"false": false,
-		"FALSE": false,
-		"no":    false,
-		"1":     true,
-		"true":  true,
-		"yes":   true,
-		"ship":  true,
-	}
-	for value, want := range tests {
-		if got := overrideRequested(value); got != want {
-			t.Errorf("overrideRequested(%q) = %t, want %t", value, got, want)
 		}
 	}
 }

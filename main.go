@@ -38,11 +38,6 @@ const (
 	// step can be a bare `go run .`.
 	defaultConfigPath = ".github/deploy-window.yml"
 
-	// overrideEnvVar lets an operator force a deployment past the rules.
-	// Any value other than the empty string, "0", "false" or "no"
-	// (case-insensitive) counts as set.
-	overrideEnvVar = "DEPLOY_GATE_OVERRIDE"
-
 	// reasonNoMatch is reported when no rule matched and the default
 	// action decided the outcome.
 	reasonNoMatch = "no rule matched"
@@ -219,7 +214,7 @@ func main() {
 		os.Exit(exitAllowed)
 	}
 
-	decision, err := Evaluate(*configPath, time.Now(), os.Getenv(overrideEnvVar))
+	decision, err := Evaluate(*configPath, time.Now())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "deploy-gate: %v\n", err)
 		os.Exit(exitConfigError)
@@ -243,14 +238,12 @@ Usage:
 It prints two KEY=value lines on stdout, ready for $GITHUB_OUTPUT:
 
   allowed=true|false
-  reason=<name of the deciding rule | "manual override" | "no rule matched">
+  reason=<name of the deciding rule | "no rule matched">
 
 Exit codes:
   0  allowed
   1  denied
   2  the config is missing, unparseable or invalid (error on stderr)
-
-Set `+overrideEnvVar+` to a value other than 0/false/no to force a deploy.
 
 Flags:
 `)
@@ -272,27 +265,12 @@ func sanitize(s string) string {
 // Evaluate loads the config at path and decides whether deploying is allowed
 // at the given time. A non-nil error means the config is unusable; callers
 // must never treat that as "allowed".
-func Evaluate(path string, now time.Time, override string) (Decision, error) {
-	if overrideRequested(override) {
-		return Decision{Allowed: true, Reason: "manual override"}, nil
-	}
-
+func Evaluate(path string, now time.Time) (Decision, error) {
 	cfg, err := LoadConfig(path)
 	if err != nil {
 		return Decision{}, err
 	}
 	return cfg.Decide(now)
-}
-
-// overrideRequested reports whether the override env var value asks for a
-// forced deployment.
-func overrideRequested(v string) bool {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "", "0", "false", "no":
-		return false
-	default:
-		return true
-	}
 }
 
 // LoadConfig reads, parses and validates a config file.
