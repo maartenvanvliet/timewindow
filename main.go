@@ -240,13 +240,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	if *showVersion {
 		stamped, ok := debug.ReadBuildInfo()
-		fmt.Fprintln(stdout, resolveBuildInfo(version, commit, date, stamped, ok))
+		// Nothing useful to do if the stream is gone.
+		_, _ = fmt.Fprintln(stdout, resolveBuildInfo(version, commit, date, stamped, ok))
 		return exitAllowed
 	}
 
 	decision, err := evaluate(*configPath, *at, *format, stdout, *quiet)
 	if err != nil {
-		fmt.Fprintf(stderr, "%s: %v\n", programName, err)
+		_, _ = fmt.Fprintf(stderr, "%s: %v\n", programName, err)
 		return exitError
 	}
 	if !decision.Allowed {
@@ -294,7 +295,7 @@ func resolveTime(at string) (time.Time, error) {
 // usage keeps the exit codes in front of the reader, since they are the part
 // of this tool a caller is most likely to get wrong.
 func usage(w io.Writer, flags *flag.FlagSet) {
-	fmt.Fprintf(w, `%s reports whether a point in time is allowed by a policy of
+	_, _ = fmt.Fprintf(w, `%s reports whether a point in time is allowed by a policy of
 time-based rules. Rules are evaluated top to bottom and the last match wins.
 
 Usage:

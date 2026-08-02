@@ -1,43 +1,32 @@
 version: 2
 
-project_name: timewindow
+before:
+  hooks:
+    - go mod tidy
 
 builds:
   - env:
       - CGO_ENABLED=0
-    goos: [linux, darwin, windows]
-    goarch: [amd64, arm64]
-    ignore:
-      - goos: windows
-        goarch: arm64
-    # -trimpath keeps local build paths out of the binaries; the ldflags are
-    # what `timewindow -version` reports.
-    flags:
-      - -trimpath
-    ldflags:
-      - -s -w
-      - -X main.version={{ .Version }}
-      - -X main.commit={{ .FullCommit }}
-      - -X main.date={{ .Date }}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
 
 archives:
-  # Flat archives, so a caller can pull out just the binary:
-  #   curl -sSfL <url> | tar xz timewindow
   - formats: [tar.gz]
-    format_overrides:
-      - goos: windows
-        formats: [zip]
-    name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
+    name_template: >-
+      {{ .ProjectName }}_{{ .Os }}_{{ .Arch }}
     files:
       - README.md
-      - LICENSE*
 
 checksum:
-  name_template: checksums.txt
+  name_template: "checksums.txt"
 
 changelog:
-  use: github-native
-
-release:
-  # A tag with a prerelease suffix (v1.0.0-rc.1) is published as one.
-  prerelease: auto
+  sort: asc
+  filters:
+    exclude:
+      - "^test:"
+      - "^chore:"
