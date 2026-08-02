@@ -78,7 +78,7 @@ type BuildInfo struct {
 // from the toolchain's own VCS stamps, so `go build` and `go install` binaries
 // still identify themselves.
 func resolveBuildInfo(version, commit, date string, bi *debug.BuildInfo, ok bool) BuildInfo {
-	out := BuildInfo{Version: version, Commit: commit, Date: date}
+	out := BuildInfo{Version: version, Commit: shortCommit(commit), Date: date}
 	if !ok || bi == nil {
 		return out
 	}
@@ -103,7 +103,8 @@ func resolveBuildInfo(version, commit, date string, bi *debug.BuildInfo, ok bool
 	return out
 }
 
-// shortCommit trims a full SHA down to the usual display length.
+// shortCommit trims a full SHA down to the usual display length, wherever it
+// came from: a release injects the full one.
 func shortCommit(sha string) string {
 	if len(sha) > 12 {
 		return sha[:12]

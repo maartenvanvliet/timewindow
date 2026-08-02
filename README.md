@@ -166,11 +166,11 @@ Each release publishes static binaries for linux, macOS and Windows
 [releases page](https://github.com/maartenvanvliet/timewindow/releases), or:
 
 ```sh
-VERSION=v1.0.0
+VERSION=1.0.0   # the tag is v1.0.0; archive names drop the v
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 
-curl -sSfL "https://github.com/maartenvanvliet/timewindow/releases/download/${VERSION}/timewindow_${VERSION}_${OS}_${ARCH}.tar.gz" \
+curl -sSfL "https://github.com/maartenvanvliet/timewindow/releases/download/v${VERSION}/timewindow_${VERSION}_${OS}_${ARCH}.tar.gz" \
   | tar xz timewindow
 ```
 
@@ -178,8 +178,8 @@ The archives are flat, so `tar xz timewindow` pulls out just the binary. To
 check it against the published checksums first:
 
 ```sh
-curl -sSfLO "https://github.com/maartenvanvliet/timewindow/releases/download/${VERSION}/timewindow_${VERSION}_${OS}_${ARCH}.tar.gz"
-curl -sSfL "https://github.com/maartenvanvliet/timewindow/releases/download/${VERSION}/checksums.txt" \
+curl -sSfLO "https://github.com/maartenvanvliet/timewindow/releases/download/v${VERSION}/timewindow_${VERSION}_${OS}_${ARCH}.tar.gz"
+curl -sSfL "https://github.com/maartenvanvliet/timewindow/releases/download/v${VERSION}/checksums.txt" \
   | grep "timewindow_${VERSION}_${OS}_${ARCH}.tar.gz" | sha256sum -c -
 ```
 
@@ -193,7 +193,7 @@ Every binary reports its own provenance:
 
 ```console
 $ timewindow -version
-timewindow v1.0.0
+timewindow 1.0.0
 commit: 0123456789ab
 built:  2026-08-02T10:00:00Z
 go:     go1.22.0 linux/amd64
@@ -250,7 +250,7 @@ append to it directly:
 ```yaml
 - name: Install timewindow
   run: |
-    curl -sSfL https://github.com/maartenvanvliet/timewindow/releases/download/v1.0.0/timewindow_v1.0.0_linux_amd64.tar.gz \
+    curl -sSfL https://github.com/maartenvanvliet/timewindow/releases/download/v1.0.0/timewindow_1.0.0_linux_amd64.tar.gz \
       | tar xz timewindow
 - id: check
   run: |
@@ -299,28 +299,38 @@ first, when you need the exit codes intact.
 
 ## Releasing
 
-Tag and push; [`.github/workflows/release.yml`](.github/workflows/release.yml)
-does the rest:
+Run the **release** workflow from the Actions tab and pick `patch`, `minor` or
+`major`. It works out the next version from the highest existing tag, tags the
+commit and publishes the release — no local tagging step:
 
-```sh
-git tag -a v1.0.0 -m 'v1.0.0'
-git push origin v1.0.0
+```
+v1.2.3  --patch-->  v1.2.4
+        --minor-->  v1.3.0
+        --major-->  v2.0.0
 ```
 
-The workflow checks formatting, runs `go vet` and the tests, builds the
-archives and publishes them with generated release notes. A tag containing a
-hyphen (`v1.0.0-rc.1`) is published as a pre-release. Nothing is published if
-the tests fail.
-
-The build itself is a plain script, so a release can be reproduced locally:
+The `version` input overrides that when you want an exact tag, including a
+pre-release like `v1.0.0-rc.1`, which is published as one. Tagging by hand
+still works and takes the same path:
 
 ```sh
-VERSION=v1.0.0 ./script/build-release.sh   # writes dist/
+git tag -a v1.0.0 -m v1.0.0 && git push origin v1.0.0
 ```
 
-Builds are `CGO_ENABLED=0 -trimpath`, so the binaries are static and free of
-local paths; `SOURCE_DATE_EPOCH` is honoured if you want the timestamp fixed
-too.
+Either way the workflow checks formatting, runs `go vet` and the tests, and
+only then hands off to [GoReleaser](https://goreleaser.com), which builds every
+target, packages the archives and checksums, and publishes them with
+GitHub-generated notes. Nothing is tagged or published from a red tree.
+
+To see what a release would contain, without tagging or publishing anything:
+
+```sh
+goreleaser check                       # validate .goreleaser.yml
+goreleaser release --snapshot --clean  # writes dist/
+```
+
+Builds are `CGO_ENABLED=0 -trimpath`, so the binaries are static and carry no
+local paths.
 
 ## Tests
 

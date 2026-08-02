@@ -692,6 +692,12 @@ func TestResolveBuildInfo(t *testing.T) {
 			want: BuildInfo{Version: "v1.2.3", Commit: "abcdef123456", Date: "2026-08-02T10:00:00Z"},
 		},
 		{
+			name:    "an injected full sha is trimmed for display",
+			version: "v1.2.3", commit: "0123456789abcdef0123456789abcdef01234567", date: "2026-08-02T10:00:00Z",
+			stamped: stamped, ok: true,
+			want: BuildInfo{Version: "v1.2.3", Commit: "0123456789ab", Date: "2026-08-02T10:00:00Z"},
+		},
+		{
 			name:    "a go install build describes itself from the stamps",
 			version: "dev",
 			stamped: stamped, ok: true,
