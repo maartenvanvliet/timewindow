@@ -161,16 +161,16 @@ A break-glass path belongs to the caller, which can simply not call it.
 
 ## Install
 
-Each release publishes static binaries for linux, macOS and Windows
-(amd64/arm64), plus a `checksums.txt`. Grab one from the
+Each release publishes static binaries for linux and macOS (amd64/arm64),
+plus a `checksums.txt`. Grab one from the
 [releases page](https://github.com/maartenvanvliet/timewindow/releases), or:
 
 ```sh
-VERSION=1.0.0   # the tag is v1.0.0; archive names drop the v
+VERSION=v1.0.0
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 
-curl -sSfL "https://github.com/maartenvanvliet/timewindow/releases/download/v${VERSION}/timewindow_${VERSION}_${OS}_${ARCH}.tar.gz" \
+curl -sSfL "https://github.com/maartenvanvliet/timewindow/releases/download/${VERSION}/timewindow_${OS}_${ARCH}.tar.gz" \
   | tar xz timewindow
 ```
 
@@ -178,9 +178,9 @@ The archives are flat, so `tar xz timewindow` pulls out just the binary. To
 check it against the published checksums first:
 
 ```sh
-curl -sSfLO "https://github.com/maartenvanvliet/timewindow/releases/download/v${VERSION}/timewindow_${VERSION}_${OS}_${ARCH}.tar.gz"
-curl -sSfL "https://github.com/maartenvanvliet/timewindow/releases/download/v${VERSION}/checksums.txt" \
-  | grep "timewindow_${VERSION}_${OS}_${ARCH}.tar.gz" | sha256sum -c -
+curl -sSfLO "https://github.com/maartenvanvliet/timewindow/releases/download/${VERSION}/timewindow_${OS}_${ARCH}.tar.gz"
+curl -sSfL "https://github.com/maartenvanvliet/timewindow/releases/download/${VERSION}/checksums.txt" \
+  | grep "timewindow_${OS}_${ARCH}.tar.gz" | sha256sum -c -
 ```
 
 From source:
@@ -250,7 +250,7 @@ append to it directly:
 ```yaml
 - name: Install timewindow
   run: |
-    curl -sSfL https://github.com/maartenvanvliet/timewindow/releases/download/v1.0.0/timewindow_1.0.0_linux_amd64.tar.gz \
+    curl -sSfL https://github.com/maartenvanvliet/timewindow/releases/download/v1.0.0/timewindow_linux_amd64.tar.gz \
       | tar xz timewindow
 - id: check
   run: |
@@ -299,9 +299,18 @@ first, when you need the exit codes intact.
 
 ## Releasing
 
-Run the **release** workflow from the Actions tab and pick `patch`, `minor` or
-`major`. It works out the next version from the highest existing tag, tags the
-commit and publishes the release — no local tagging step:
+Push a tag and [`.github/workflows/release.yml`](.github/workflows/release.yml)
+runs the tests and hands off to [GoReleaser](https://goreleaser.com), which
+builds every target, packages the archives and checksums, and publishes them
+with a changelog:
+
+```sh
+git tag -a v1.0.0 -m v1.0.0 && git push origin v1.0.0
+```
+
+Or run the workflow from the Actions tab and pick `patch`, `minor` or `major`,
+and it works out the next version from the highest existing tag, tags the
+commit and releases it — no local tagging step:
 
 ```
 v1.2.3  --patch-->  v1.2.4
@@ -309,18 +318,7 @@ v1.2.3  --patch-->  v1.2.4
         --major-->  v2.0.0
 ```
 
-The `version` input overrides that when you want an exact tag, including a
-pre-release like `v1.0.0-rc.1`, which is published as one. Tagging by hand
-still works and takes the same path:
-
-```sh
-git tag -a v1.0.0 -m v1.0.0 && git push origin v1.0.0
-```
-
-Either way the workflow checks formatting, runs `go vet` and the tests, and
-only then hands off to [GoReleaser](https://goreleaser.com), which builds every
-target, packages the archives and checksums, and publishes them with
-GitHub-generated notes. Nothing is tagged or published from a red tree.
+The `version` input overrides that when you want an exact tag.
 
 To see what a release would contain, without tagging or publishing anything:
 
@@ -329,14 +327,15 @@ goreleaser check                       # validate .goreleaser.yml
 goreleaser release --snapshot --clean  # writes dist/
 ```
 
-Builds are `CGO_ENABLED=0 -trimpath`, so the binaries are static and carry no
-local paths.
-
 ## Tests
 
 ```
-go test ./...
+go test ./... -race -cover
 ```
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs that on every push
+and pull request, alongside `gofmt`, `go vet`, `golangci-lint` and a build of
+each release target.
 
 Table-driven cases cover office hours, the Friday cutoff, the weekend, both
 halves of the Christmas freeze, the DST switch, and the engine itself: a later
