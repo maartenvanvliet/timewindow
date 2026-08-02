@@ -6,10 +6,10 @@
 // narrower denies after them. Each rule matches on Prometheus Alertmanager's
 // time_intervals schema.
 //
-// The decision goes to stdout and to the exit status, so it can gate anything
-// a shell can gate:
+// The decision is the exit status, and nothing is printed unless a -format is
+// asked for, so it can gate anything a shell can gate:
 //
-//	timewindow -quiet || exit 0
+//	timewindow || exit 0
 //
 // Exit codes:
 //
@@ -46,6 +46,10 @@ const (
 	// defaultConfigPath is where the policy is read from when -config is
 	// not given.
 	defaultConfigPath = "timewindow.yml"
+
+	// envPrefix namespaces the environment variables that stand in for
+	// flags: -config is also TIMEWINDOW_CONFIG.
+	envPrefix = "TIMEWINDOW_"
 
 	// reasonNoMatch is reported when no rule matched and the default
 	// action decided the outcome.
@@ -215,20 +219,20 @@ type Decision struct {
 }
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(run(os.Args[1:], os.LookupEnv, os.Stdout, os.Stderr))
 }
 
 // run is the whole CLI, so that argument handling, output and exit codes can
-// be exercised in tests the same way a caller sees them.
-func run(args []string, stdout, stderr io.Writer) int {
+// be exercised in tests the same way a caller sees them. The environment is
+// passed in for the same reason.
+func run(args []string, env EnvLookup, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet(programName, flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() { usage(stderr, flags) }
 
-	configPath := flags.String("config", defaultConfigPath, "path to the policy file, or - for stdin")
-	at := flags.String("at", "", "evaluate at this RFC 3339 time instead of now")
-	format := flags.String("format", string(FormatKeyValue), "output format: key-value or json")
-	quiet := flags.Bool("quiet", false, "print nothing; report the decision through the exit status only")
+	configPath := flags.String("config", defaultConfigPath, "path to the policy file, or - for stdin ["+envName("config")+"]")
+	at := flags.String("at", "", "evaluate at this RFC 3339 time instead of now ["+envName("at")+"]")
+	format := flags.String("format", string(FormatNone), "output format: "+formatNames()+" ["+envName("format")+"]")
 	showVersion := flags.Bool("version", false, "print version information and exit")
 
 	if err := flags.Parse(args); err != nil {
@@ -245,7 +249,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return exitAllowed
 	}
 
-	decision, err := evaluate(*configPath, *at, *format, stdout, *quiet)
+	if err := applyEnv(flags, env); err != nil {
+		_, _ = fmt.Fprintf(stderr, "%s: %v\n", programName, err)
+		return exitError
+	}
+
+	decision, err := evaluate(*configPath, *at, *format, stdout)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "%s: %v\n", programName, err)
 		return exitError
@@ -256,8 +265,44 @@ func run(args []string, stdout, stderr io.Writer) int {
 	return exitAllowed
 }
 
+// EnvLookup reads an environment variable, like os.LookupEnv.
+type EnvLookup func(name string) (string, bool)
+
+// envName is the environment variable a flag can also be set with.
+func envName(flagName string) string {
+	return envPrefix + strings.ToUpper(strings.ReplaceAll(flagName, "-", "_"))
+}
+
+// applyEnv fills in the flags that were not given on the command line from the
+// environment, so a flag always wins over its variable. Every flag gets one,
+// except -version, which only makes sense as an argument.
+func applyEnv(flags *flag.FlagSet, env EnvLookup) error {
+	if env == nil {
+		return nil
+	}
+
+	given := make(map[string]bool)
+	flags.Visit(func(f *flag.Flag) { given[f.Name] = true })
+
+	var err error
+	flags.VisitAll(func(f *flag.Flag) {
+		if err != nil || given[f.Name] || f.Name == "version" {
+			return
+		}
+		name := envName(f.Name)
+		value, ok := env(name)
+		if !ok {
+			return
+		}
+		if setErr := flags.Set(f.Name, value); setErr != nil {
+			err = fmt.Errorf("%s: %w", name, setErr)
+		}
+	})
+	return err
+}
+
 // evaluate resolves the arguments, makes the decision and reports it.
-func evaluate(configPath, at, format string, stdout io.Writer, quiet bool) (Decision, error) {
+func evaluate(configPath, at, format string, stdout io.Writer) (Decision, error) {
 	when, err := resolveTime(at)
 	if err != nil {
 		return Decision{}, err
@@ -272,10 +317,8 @@ func evaluate(configPath, at, format string, stdout io.Writer, quiet bool) (Deci
 		return Decision{}, err
 	}
 
-	if !quiet {
-		if err := writeOutput(stdout, decision, outputFormat); err != nil {
-			return Decision{}, err
-		}
+	if err := writeOutput(stdout, decision, outputFormat); err != nil {
+		return Decision{}, err
 	}
 	return decision, nil
 }
@@ -306,9 +349,13 @@ Exit codes:
   1  denied
   2  the policy or the arguments could not be used (message on stderr)
 
-The exit status is the whole answer, so the decision can gate a shell:
+The exit status is the whole answer, and nothing is printed unless you ask for
+a -format, so the decision can gate a shell:
 
-  %s -quiet && ./release.sh
+  %s && ./release.sh
+
+Every flag except -version can also be set with the environment variable named
+in its description. A flag wins over its variable.
 
 Flags:
 `, programName, programName, programName)
@@ -319,33 +366,60 @@ Flags:
 type Format string
 
 const (
+	// FormatNone writes nothing: the exit status carries the answer. It is
+	// the default, because most callers only branch on the decision.
+	FormatNone Format = "none"
+
 	// FormatKeyValue writes `key=value` lines. It suits shell `eval` and
 	// appending to a CI step's output file.
 	FormatKeyValue Format = "key-value"
 
 	// FormatJSON writes one JSON object.
 	FormatJSON Format = "json"
+
+	// FormatText writes one line for a person to read.
+	FormatText Format = "text"
 )
+
+// formats are the accepted -format values, in the order they are offered.
+var formats = []Format{FormatNone, FormatKeyValue, FormatJSON, FormatText}
+
+// formatNames lists the accepted values for help and error messages.
+func formatNames() string {
+	names := make([]string, len(formats))
+	for i, f := range formats {
+		names[i] = string(f)
+	}
+	return strings.Join(names, ", ")
+}
 
 // ParseFormat validates an output format name.
 func ParseFormat(s string) (Format, error) {
-	switch Format(strings.ToLower(strings.TrimSpace(s))) {
-	case FormatKeyValue:
-		return FormatKeyValue, nil
-	case FormatJSON:
-		return FormatJSON, nil
-	default:
-		return "", fmt.Errorf("-format: must be %q or %q, got %q", FormatKeyValue, FormatJSON, s)
+	candidate := Format(strings.ToLower(strings.TrimSpace(s)))
+	for _, f := range formats {
+		if candidate == f {
+			return f, nil
+		}
 	}
+	return "", fmt.Errorf("-format: must be one of %s, got %q", formatNames(), s)
 }
 
 // writeOutput renders the decision in the requested format.
 func writeOutput(w io.Writer, d Decision, format Format) error {
 	switch format {
+	case FormatNone:
+		return nil
 	case FormatJSON:
 		encoder := json.NewEncoder(w)
 		encoder.SetEscapeHTML(false)
 		return encoder.Encode(d)
+	case FormatText:
+		verdict := "denied"
+		if d.Allowed {
+			verdict = "allowed"
+		}
+		_, err := fmt.Fprintf(w, "%s (%s)\n", verdict, sanitize(d.Reason))
+		return err
 	default:
 		_, err := fmt.Fprintf(w, "allowed=%t\nreason=%s\n", d.Allowed, sanitize(d.Reason))
 		return err
