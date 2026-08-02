@@ -9,49 +9,97 @@ import (
 	"time"
 )
 
-// exampleConfig is the config from the README, verbatim in its interval
-// definitions, wired to a policy that allows deploys during office hours and
-// blocks them during the Christmas freeze.
-const exampleConfig = `
+// officeConfig mirrors the shipped policy: a broad weekday allow, with a
+// Friday cutoff and a Christmas freeze layered after it.
+const officeConfig = `
 timezone: Europe/Amsterdam
+default: deny
 
-active_time_intervals: ['office-hours']
-mute_time_intervals: ['christmas-freeze']
-
-time_intervals:
+rules:
   - name: office-hours
+    action: allow
     time_intervals:
-      - weekdays: ['monday:thursday']
+      - weekdays: ['monday:friday']
         times: [{ start_time: '09:00', end_time: '18:00' }]
+  - name: friday-afternoon
+    action: deny
+    time_intervals:
       - weekdays: ['friday']
-        times: [{ start_time: '09:00', end_time: '14:00' }]
+        times: [{ start_time: '14:00', end_time: '24:00' }]
   - name: christmas-freeze
+    action: deny
     time_intervals:
       - months: ['december']
         days_of_month: ['22:31']
-        Action: deny
       - months: ['january']
         days_of_month: ['1:2']
-        Action: deny
 `
 
-const unknownIntervalConfig = `
+// reAllowConfig layers an allow after a deny, to show that a later rule can
+// punch a hole in an earlier one.
+const reAllowConfig = `
 timezone: Europe/Amsterdam
+default: deny
 
-active_time_intervals: ['office-hourz']
+rules:
+  - name: always
+    action: allow
+    time_intervals:
+      - {}
+  - name: christmas-freeze
+    action: deny
+    time_intervals:
+      - months: ['december']
+        days_of_month: ['22:31']
+  - name: freeze-hotfix-window
+    action: allow
+    time_intervals:
+      - months: ['december']
+        days_of_month: ['27']
+        times: [{ start_time: '10:00', end_time: '12:00' }]
+`
 
-time_intervals:
-  - name: office-hours
+// allowThenDeny and denyThenAllow hold the same two rules in either order.
+const allowThenDeny = `
+timezone: Europe/Amsterdam
+rules:
+  - name: weekdays
+    action: allow
+    time_intervals:
+      - weekdays: ['monday:friday']
+  - name: fridays
+    action: deny
+    time_intervals:
+      - weekdays: ['friday']
+`
+
+const denyThenAllow = `
+timezone: Europe/Amsterdam
+rules:
+  - name: fridays
+    action: deny
+    time_intervals:
+      - weekdays: ['friday']
+  - name: weekdays
+    action: allow
     time_intervals:
       - weekdays: ['monday:friday']
 `
 
 const malformedConfig = `
 timezone: Europe/Amsterdam
+rules:
+  - name: office-hours
+   action: allow
+`
+
+const legacyConfig = `
+timezone: Europe/Amsterdam
+active_time_intervals: ['office-hours']
 time_intervals:
   - name: office-hours
-   time_intervals:
-      - weekdays: ['monday'
+    time_intervals:
+      - weekdays: ['monday:friday']
 `
 
 // amsterdam returns a local wall-clock time in Europe/Amsterdam.
@@ -84,103 +132,176 @@ func TestEvaluate(t *testing.T) {
 		config     string
 		now        string // wall clock in Europe/Amsterdam
 		override   string
-		wantErr    bool
-		wantErrMsg string // substring of the error
 		wantAllow  bool
 		wantReason string
 	}{
 		{
 			name:       "within office hours on a wednesday",
-			config:     exampleConfig,
+			config:     officeConfig,
 			now:        "2026-03-11 10:30",
 			wantAllow:  true,
 			wantReason: "office-hours",
 		},
 		{
-			name:       "friday before the early close",
-			config:     exampleConfig,
+			name:       "friday before the cutoff",
+			config:     officeConfig,
 			now:        "2026-03-13 13:59",
 			wantAllow:  true,
 			wantReason: "office-hours",
 		},
 		{
-			name:       "friday after 14:00",
-			config:     exampleConfig,
+			name:       "friday after 14:00 hits the layered deny",
+			config:     officeConfig,
 			now:        "2026-03-13 14:01",
 			wantAllow:  false,
-			wantReason: "no active window matched",
+			wantReason: "friday-afternoon",
 		},
 		{
-			name:       "weekend",
-			config:     exampleConfig,
+			name:       "weekend falls through to the default",
+			config:     officeConfig,
 			now:        "2026-03-14 11:00",
 			wantAllow:  false,
-			wantReason: "no active window matched",
+			wantReason: reasonNoMatch,
 		},
 		{
-			name:       "inside the christmas freeze during office hours",
-			config:     exampleConfig,
+			name:       "before opening time falls through to the default",
+			config:     officeConfig,
+			now:        "2026-03-11 08:59",
+			wantAllow:  false,
+			wantReason: reasonNoMatch,
+		},
+		{
+			name:       "christmas freeze overrides office hours",
+			config:     officeConfig,
 			now:        "2026-12-23 10:00",
 			wantAllow:  false,
 			wantReason: "christmas-freeze",
 		},
 		{
-			name:       "inside the january tail of the freeze",
-			config:     exampleConfig,
+			name:       "january tail of the freeze overrides office hours",
+			config:     officeConfig,
 			now:        "2027-01-01 10:00",
 			wantAllow:  false,
 			wantReason: "christmas-freeze",
 		},
 		{
 			name:       "just after the freeze ends",
-			config:     exampleConfig,
+			config:     officeConfig,
 			now:        "2027-01-04 10:00",
 			wantAllow:  true,
 			wantReason: "office-hours",
 		},
 		{
-			name:       "override wins over a closed window",
-			config:     exampleConfig,
-			now:        "2026-03-14 11:00",
+			name:       "monday after the DST switch still opens at 09:00 local",
+			config:     officeConfig,
+			now:        "2026-03-30 09:30",
+			wantAllow:  true,
+			wantReason: "office-hours",
+		},
+		{
+			name:       "override wins over a denying rule",
+			config:     officeConfig,
+			now:        "2026-12-23 10:00",
 			override:   "true",
 			wantAllow:  true,
 			wantReason: "manual override",
 		},
 		{
 			name:       "falsey override does not force a deploy",
-			config:     exampleConfig,
-			now:        "2026-03-14 11:00",
+			config:     officeConfig,
+			now:        "2026-12-23 10:00",
 			override:   "false",
 			wantAllow:  false,
-			wantReason: "no active window matched",
+			wantReason: "christmas-freeze",
+		},
+
+		// Last match wins.
+		{
+			name:       "later deny beats an earlier allow",
+			config:     allowThenDeny,
+			now:        "2026-03-13 10:00",
+			wantAllow:  false,
+			wantReason: "fridays",
 		},
 		{
-			name:       "no windows configured allows deploying",
-			config:     "timezone: Europe/Amsterdam\n",
-			now:        "2026-03-14 11:00",
+			name:       "same rules in the other order flip the outcome",
+			config:     denyThenAllow,
+			now:        "2026-03-13 10:00",
 			wantAllow:  true,
-			wantReason: "no deploy window configured",
+			wantReason: "weekdays",
 		},
 		{
-			name:       "unknown interval name in policy",
-			config:     unknownIntervalConfig,
-			now:        "2026-03-11 10:30",
-			wantErr:    true,
-			wantErrMsg: `active_time_intervals references undefined time interval "office-hourz"`,
+			name:       "an allow can punch a hole in an earlier deny",
+			config:     reAllowConfig,
+			now:        "2026-12-27 10:30",
+			wantAllow:  true,
+			wantReason: "freeze-hotfix-window",
 		},
 		{
-			name:       "malformed yaml",
-			config:     malformedConfig,
-			now:        "2026-03-11 10:30",
-			wantErr:    true,
-			wantErrMsg: "parsing config",
+			name:       "outside the hole the earlier deny still stands",
+			config:     reAllowConfig,
+			now:        "2026-12-27 13:00",
+			wantAllow:  false,
+			wantReason: "christmas-freeze",
 		},
 		{
-			name:       "invalid timezone",
-			config:     "timezone: Mars/Olympus_Mons\n",
+			name:       "an empty interval matches every time",
+			config:     reAllowConfig,
+			now:        "2026-07-05 03:00",
+			wantAllow:  true,
+			wantReason: "always",
+		},
+
+		// Defaults.
+		{
+			name:       "default is deny when omitted",
+			config:     "rules: []\n",
 			now:        "2026-03-11 10:30",
-			wantErr:    true,
-			wantErrMsg: "invalid timezone",
+			wantAllow:  false,
+			wantReason: reasonNoMatch,
+		},
+		{
+			name:       "default allow lets unmatched times through",
+			config:     "default: allow\n" + strings.TrimPrefix(allowThenDeny, "\n"),
+			now:        "2026-03-14 10:00",
+			wantAllow:  true,
+			wantReason: reasonNoMatch,
+		},
+		{
+			name:       "an empty config denies rather than waving deploys through",
+			config:     "timezone: Europe/Amsterdam\n",
+			now:        "2026-03-11 10:30",
+			wantAllow:  false,
+			wantReason: reasonNoMatch,
+		},
+
+		// Naming.
+		{
+			name: "unnamed rules are reported by position",
+			config: `
+rules:
+  - action: allow
+    time_intervals:
+      - {}
+`,
+			now:        "2026-03-11 10:30",
+			wantAllow:  true,
+			wantReason: "rule[0]",
+		},
+
+		// Without a timezone, intervals are matched in UTC.
+		{
+			name: "no timezone means UTC",
+			config: `
+rules:
+  - name: utc-office-hours
+    action: allow
+    time_intervals:
+      - times: [{ start_time: '09:00', end_time: '18:00' }]
+`,
+			now:        "2026-03-11 09:30", // 08:30 UTC
+			wantAllow:  false,
+			wantReason: reasonNoMatch,
 		},
 	}
 
@@ -189,22 +310,135 @@ func TestEvaluate(t *testing.T) {
 			path := writeConfig(t, tc.config)
 
 			got, err := Evaluate(path, amsterdam(t, tc.now), tc.override)
-
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("Evaluate() = %+v, want error", got)
-				}
-				if !strings.Contains(err.Error(), tc.wantErrMsg) {
-					t.Fatalf("error = %q, want it to contain %q", err, tc.wantErrMsg)
-				}
-				return
-			}
 			if err != nil {
 				t.Fatalf("Evaluate() error = %v", err)
 			}
 			if got.Allowed != tc.wantAllow || got.Reason != tc.wantReason {
 				t.Errorf("Evaluate() = {allowed:%t reason:%q}, want {allowed:%t reason:%q}",
 					got.Allowed, got.Reason, tc.wantAllow, tc.wantReason)
+			}
+		})
+	}
+}
+
+func TestEvaluateConfigErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  string
+		wantErr string // substring of the error
+	}{
+		{
+			name:    "malformed yaml",
+			config:  malformedConfig,
+			wantErr: "parsing config",
+		},
+		{
+			name:    "pre-rules schema",
+			config:  legacyConfig,
+			wantErr: "no longer supported",
+		},
+		{
+			name:    "invalid timezone",
+			config:  "timezone: Mars/Olympus_Mons\n",
+			wantErr: "invalid timezone",
+		},
+		{
+			name:    "invalid default action",
+			config:  "default: maybe\n",
+			wantErr: `default: action must be "allow" or "deny", got "maybe"`,
+		},
+		{
+			name: "missing rule action",
+			config: `
+rules:
+  - name: office-hours
+    time_intervals:
+      - weekdays: ['monday']
+`,
+			wantErr: `rule "office-hours": action must be "allow" or "deny"`,
+		},
+		{
+			name: "unknown rule action",
+			config: `
+rules:
+  - name: office-hours
+    action: mute
+    time_intervals:
+      - weekdays: ['monday']
+`,
+			wantErr: `rule "office-hours": action must be "allow" or "deny", got "mute"`,
+		},
+		{
+			name: "rule without intervals can never match",
+			config: `
+rules:
+  - name: office-hours
+    action: allow
+`,
+			wantErr: `rule "office-hours": no time_intervals defined`,
+		},
+		{
+			name: "duplicate rule names",
+			config: `
+rules:
+  - name: office-hours
+    action: allow
+    time_intervals:
+      - weekdays: ['monday']
+  - name: office-hours
+    action: deny
+    time_intervals:
+      - weekdays: ['friday']
+`,
+			wantErr: `duplicate rule name "office-hours"`,
+		},
+		{
+			name: "action nested under time_intervals",
+			config: `
+rules:
+  - name: christmas-freeze
+    action: deny
+    time_intervals:
+      - months: ['december']
+        action: deny
+`,
+			wantErr: "`action` belongs on the rule",
+		},
+		{
+			name: "capitalised action nested under time_intervals",
+			config: `
+rules:
+  - name: christmas-freeze
+    action: deny
+    time_intervals:
+      - months: ['december']
+        Action: deny
+`,
+			wantErr: "`action` belongs on the rule",
+		},
+		{
+			name: "invalid interval body",
+			config: `
+rules:
+  - name: office-hours
+    action: allow
+    time_intervals:
+      - weekdays: ['funday']
+`,
+			wantErr: "parsing config",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeConfig(t, tc.config)
+
+			got, err := Evaluate(path, time.Now(), "")
+			if err == nil {
+				t.Fatalf("Evaluate() = %+v, want error", got)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %q, want it to contain %q", err, tc.wantErr)
 			}
 		})
 	}
@@ -231,19 +465,35 @@ func TestEvaluateOverrideSkipsConfig(t *testing.T) {
 	}
 }
 
-// TestShippedConfigParses guards the config committed at .github/deploy-window.yml.
-func TestShippedConfigParses(t *testing.T) {
+// TestShippedConfig guards the config committed at .github/deploy-window.yml.
+func TestShippedConfig(t *testing.T) {
 	cfg, err := LoadConfig(filepath.Join(".github", "deploy-window.yml"))
 	if err != nil {
 		t.Fatalf("LoadConfig() error = %v", err)
 	}
 
-	got, err := cfg.Decide(amsterdam(t, "2026-03-11 10:30"))
-	if err != nil {
-		t.Fatalf("Decide() error = %v", err)
+	tests := []struct {
+		now        string
+		wantAllow  bool
+		wantReason string
+	}{
+		{"2026-03-11 10:30", true, "office-hours"},
+		{"2026-03-13 14:01", false, "friday-afternoon"},
+		{"2026-03-14 11:00", false, reasonNoMatch},
+		{"2026-12-23 10:00", false, "christmas-freeze"},
 	}
-	if !got.Allowed || got.Reason != "office-hours" {
-		t.Errorf("Decide() = %+v, want allowed during office-hours", got)
+
+	for _, tc := range tests {
+		t.Run(tc.now, func(t *testing.T) {
+			got, err := cfg.Decide(amsterdam(t, tc.now))
+			if err != nil {
+				t.Fatalf("Decide() error = %v", err)
+			}
+			if got.Allowed != tc.wantAllow || got.Reason != tc.wantReason {
+				t.Errorf("Decide() = {allowed:%t reason:%q}, want {allowed:%t reason:%q}",
+					got.Allowed, got.Reason, tc.wantAllow, tc.wantReason)
+			}
+		})
 	}
 }
 

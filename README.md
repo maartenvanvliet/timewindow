@@ -4,10 +4,15 @@ A small Go CLI that decides whether a production deployment is allowed to run
 right now. It is meant to be a step in a GitHub Actions workflow, in front of a
 deploy job.
 
-The config reuses [Prometheus Alertmanager's](https://prometheus.io/docs/alerting/latest/configuration/#time_interval)
-`time_intervals` schema verbatim — weekdays, months, days_of_month, years,
-times and location are parsed by `github.com/prometheus/alertmanager/timeinterval`
-itself, and all matching is done by `timeinterval.NewIntervener(...).Mutes(...)`.
+Policy is a list of **rules**, evaluated like firewall rules: top to bottom,
+**last match wins**. That lets you start from a broad allow and layer narrower
+denies (and then exceptions to those denies) after it, instead of bending every
+policy into one fixed window shape.
+
+Each rule matches on [Prometheus Alertmanager's](https://prometheus.io/docs/alerting/latest/configuration/#time_interval)
+`time_intervals` schema — weekdays, months, days_of_month, years, times and
+location are parsed by `github.com/prometheus/alertmanager/timeinterval`
+itself, and matching is done by `timeinterval.NewIntervener(...).Mutes(...)`.
 None of that logic is reimplemented here.
 
 ## Config
@@ -17,41 +22,82 @@ None of that logic is reimplemented here.
 ```yaml
 timezone: Europe/Amsterdam
 
-active_time_intervals:
-  - office-hours
-mute_time_intervals:
-  - christmas-freeze
+# Action when no rule below matches.
+default: deny
 
-time_intervals:
+rules:
+  # Deploying is fine during office hours on a weekday...
   - name: office-hours
+    action: allow
     time_intervals:
-      - weekdays: ['monday:thursday']
+      - weekdays: ['monday:friday']
         times: [{ start_time: '09:00', end_time: '18:00' }]
+
+  # ...except that Friday afternoon is too late to babysit a rollback.
+  - name: friday-afternoon
+    action: deny
+    time_intervals:
       - weekdays: ['friday']
-        times: [{ start_time: '09:00', end_time: '14:00' }]
+        times: [{ start_time: '14:00', end_time: '24:00' }]
+
+  # Nothing ships over the Christmas break.
   - name: christmas-freeze
+    action: deny
     time_intervals:
       - months: ['december']
         days_of_month: ['22:31']
-        Action: deny
       - months: ['january']
         days_of_month: ['1:2']
-        Action: deny
 ```
 
 | Key | Meaning |
 | --- | --- |
-| `timezone` | Default location for intervals that do not set `location` themselves. |
-| `time_intervals` | Named interval definitions, in Alertmanager's schema. |
-| `active_time_intervals` | Windows in which deploying is allowed. Empty ⇒ no window restriction. |
-| `mute_time_intervals` | Windows in which deploying is blocked. |
+| `timezone` | Default location for intervals that do not set `location` themselves. Omitted ⇒ intervals are matched in UTC. |
+| `default` | `allow` or `deny`, applied when no rule matches. Optional; **`deny`** when omitted, so a partial or empty policy fails closed. |
+| `rules[].name` | Reported as the `reason`. Optional; an unnamed rule is called `rule[0]` after its position. Names must be unique. |
+| `rules[].action` | `allow` or `deny`. Required. |
+| `rules[].time_intervals` | Alertmanager intervals, OR'ed together: the rule matches when the current time falls in any of them. |
 
-Deploying is allowed when **(no `active_time_intervals` are configured, or the
-current time matches at least one)** and **the current time matches no
-`mute_time_intervals`**. A mute match always wins.
+### How the chain evaluates
+
+Every rule is tested against the current time. Matches do not short-circuit —
+the **last** matching rule decides, and its name becomes the reason. So in the
+config above, Friday 15:00 matches both `office-hours` and `friday-afternoon`,
+and the later one wins:
+
+```
+allowed=false
+reason=friday-afternoon
+```
+
+Order is the whole policy. The same two rules swapped give the opposite answer,
+which is the point: put the broad strokes first and the exceptions last.
+
+`time_intervals: [{}]` — one empty interval — matches every time, which is how
+you write an unconditional base rule and layer exceptions on top:
+
+```yaml
+default: deny
+rules:
+  - name: always                # broad allow
+    action: allow
+    time_intervals: [{}]
+  - name: christmas-freeze      # narrower deny
+    action: deny
+    time_intervals:
+      - months: ['december']
+        days_of_month: ['22:31']
+  - name: freeze-hotfix-window  # exception to the deny
+    action: allow
+    time_intervals:
+      - months: ['december']
+        days_of_month: ['27']
+        times: [{ start_time: '10:00', end_time: '12:00' }]
+```
 
 The IANA database is embedded (`time/tzdata`), so `Europe/Amsterdam` resolves
-even on a minimal CI image without `/usr/share/zoneinfo`.
+even on a minimal CI image without `/usr/share/zoneinfo`, and intervals are
+matched against local wall-clock time across DST switches.
 
 ## Behaviour
 
@@ -63,7 +109,7 @@ Two `KEY=value` lines on stdout, ready to be redirected into `$GITHUB_OUTPUT`:
 
 ```
 allowed=true|false
-reason=<matched interval name | "manual override" | "no active window matched" | "no deploy window configured">
+reason=<name of the deciding rule | "manual override" | "no rule matched">
 ```
 
 Exit codes:
@@ -71,17 +117,20 @@ Exit codes:
 | Code | Meaning |
 | --- | --- |
 | `0` | Allowed. |
-| `1` | Denied — outside every active window, or inside a mute window. |
-| `2` | Config missing, unparseable, referencing an undefined interval name, or carrying an invalid timezone. The error goes to stderr. |
+| `1` | Denied. |
+| `2` | Config missing, unparseable or invalid. The error goes to stderr. |
 
 A config error never degrades to "allowed": it exits `2` with a message on
 stderr, so a broken config fails the workflow instead of waving a deploy
-through.
+through. Configs are rejected — rather than quietly doing nothing — when a rule
+has no action or an unknown one, when a rule defines no intervals (it could
+never match), when two rules share a name, and when `action` is written one
+level too deep, under a `time_intervals` entry instead of on the rule.
 
-Set `DEPLOY_GATE_OVERRIDE` to force a deploy through a closed window. Any value
-other than empty, `0`, `false` or `no` (case-insensitive) counts as set; the
-config is not even read in that case, and the tool prints
-`allowed=true` / `reason=manual override`.
+Set `DEPLOY_GATE_OVERRIDE` to force a deploy past the rules. Any value other
+than empty, `0`, `false` or `no` (case-insensitive) counts as set; the config is
+not even read in that case, and the tool prints `allowed=true` /
+`reason=manual override`.
 
 ## GitHub Actions
 
@@ -124,16 +173,25 @@ first when you want that distinction:
 go test ./...
 ```
 
-Table-driven cases cover office hours, Friday after the 14:00 close, the
-weekend, both halves of the Christmas freeze, the override env var, an unknown
-interval name in the policy, malformed YAML and an invalid timezone.
+Table-driven cases cover office hours, the Friday cutoff, the weekend, both
+halves of the Christmas freeze, the DST switch, the override env var, and the
+engine itself: a later deny beating an earlier allow, the same two rules
+swapped producing the opposite outcome, an allow punching a hole in an earlier
+deny, the always-matching empty interval, and both defaults. Config errors are
+covered by their own table — malformed YAML, the pre-rules schema, a bad
+timezone, bad or missing actions, a rule with no intervals, duplicate names and
+a misplaced nested `action`.
 
 ## Notes
 
-- `Action: deny` in the example config is **not** part of Alertmanager's
-  schema. Parsing is non-strict so keys like it are ignored rather than
-  rejected; deny semantics come from listing the interval under
-  `mute_time_intervals`.
+- The pre-rules schema (top-level `time_intervals` with
+  `active_time_intervals` / `mute_time_intervals`) is rejected with a
+  migration error rather than ignored, so an old config cannot silently
+  evaluate to an empty rule chain.
+- Parsing is non-strict, so unknown keys elsewhere in the document are
+  tolerated. Note that YAML key matching is case-sensitive here: `Action:` is
+  not the same key as `action:`. Both spellings are caught inside a
+  `time_intervals` entry, since silently dropping one would change a decision.
 - `github.com/prometheus/alertmanager` is pinned to `v0.28.1` — the newest
   release whose module still builds on Go 1.22 while exposing
   `Mutes(names []string, now time.Time) (bool, []string, error)`. Later

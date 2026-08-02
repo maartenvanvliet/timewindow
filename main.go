@@ -1,12 +1,17 @@
 // Command deploy-gate decides whether a production deployment is allowed to
-// run right now, based on a YAML config that reuses Prometheus Alertmanager's
+// run right now, by evaluating a list of rules against the current time.
+//
+// Rules work like firewall rules: they are evaluated top to bottom and the
+// last one that matches wins, so a config can layer broad allows first and
+// narrower denies after them. Each rule matches on Prometheus Alertmanager's
 // time_intervals schema.
 //
-// It prints two KEY=value lines to stdout so the caller can redirect straight
-// into $GITHUB_OUTPUT, and signals the decision through its exit code:
+// The tool prints two KEY=value lines to stdout so the caller can redirect
+// straight into $GITHUB_OUTPUT, and signals the decision through its exit
+// code:
 //
 //	0 - deployment allowed
-//	1 - deployment denied by the configured windows
+//	1 - deployment denied
 //	2 - config could not be read, parsed or validated
 package main
 
@@ -15,7 +20,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sort"
 	"strings"
 	"time"
 
@@ -32,41 +36,93 @@ const (
 	// step can be a bare `go run .`.
 	defaultConfigPath = ".github/deploy-window.yml"
 
-	// overrideEnvVar lets an operator force a deployment through a closed
-	// window. Any value other than the empty string, "0", "false" or "no"
+	// overrideEnvVar lets an operator force a deployment past the rules.
+	// Any value other than the empty string, "0", "false" or "no"
 	// (case-insensitive) counts as set.
 	overrideEnvVar = "DEPLOY_GATE_OVERRIDE"
+
+	// reasonNoMatch is reported when no rule matched and the default
+	// action decided the outcome.
+	reasonNoMatch = "no rule matched"
 
 	exitAllowed     = 0
 	exitDenied      = 1
 	exitConfigError = 2
 )
 
-// Config is the outer document. The intervals themselves are parsed by
-// alertmanager's own YAML unmarshaling, so the accepted syntax for weekdays,
-// months, days_of_month, years, times and location is identical to
-// Alertmanager's.
+// Action is what a rule does when it matches.
+type Action string
+
+const (
+	ActionAllow Action = "allow"
+	ActionDeny  Action = "deny"
+)
+
+// parseAction validates an action written in the config.
+func parseAction(s string) (Action, error) {
+	switch Action(strings.ToLower(strings.TrimSpace(s))) {
+	case ActionAllow:
+		return ActionAllow, nil
+	case ActionDeny:
+		return ActionDeny, nil
+	default:
+		return "", fmt.Errorf("action must be %q or %q, got %q", ActionAllow, ActionDeny, s)
+	}
+}
+
+// Config is the outer document. Interval bodies are parsed by alertmanager's
+// own YAML unmarshaling, so the accepted syntax for weekdays, months,
+// days_of_month, years, times and location is identical to Alertmanager's.
 type Config struct {
 	// Timezone is the default location for intervals that do not carry
 	// their own `location` key.
 	Timezone string `yaml:"timezone"`
 
-	TimeIntervals []NamedTimeInterval `yaml:"time_intervals"`
+	// Default is the action to take when no rule matches. Optional;
+	// "deny" when omitted, so an empty or partial policy fails closed.
+	Default string `yaml:"default"`
 
-	// ActiveTimeIntervals lists the windows during which deploying is
-	// allowed. Empty means "no window restriction".
-	ActiveTimeIntervals []string `yaml:"active_time_intervals"`
+	// Rules are evaluated in order; the last match wins.
+	Rules []Rule `yaml:"rules"`
 
-	// MuteTimeIntervals lists the windows during which deploying is
-	// blocked. A mute match always wins over an active match.
-	MuteTimeIntervals []string `yaml:"mute_time_intervals"`
+	// defaultAction is Default, resolved during loading.
+	defaultAction Action `yaml:"-"`
+
+	// Schema from before the rule engine, kept only so a stale config gets
+	// a migration error instead of being silently ignored.
+	LegacyTimeIntervals []yaml.MapSlice `yaml:"time_intervals"`
+	LegacyActive        []string        `yaml:"active_time_intervals"`
+	LegacyMute          []string        `yaml:"mute_time_intervals"`
 }
 
-// NamedTimeInterval mirrors Alertmanager's named time interval: a name plus a
-// list of intervals that are OR'ed together.
-type NamedTimeInterval struct {
-	Name          string                      `yaml:"name"`
-	TimeIntervals []timeinterval.TimeInterval `yaml:"time_intervals"`
+// Rule is one entry in the evaluation chain: a set of time intervals and what
+// to do when the current time falls inside any of them.
+type Rule struct {
+	// Name identifies the rule in the reported reason. Optional; a rule
+	// without one is called rule[i] after its position.
+	Name string `yaml:"name"`
+
+	// Action is "allow" or "deny". Required.
+	Action string `yaml:"action"`
+
+	// TimeIntervals are OR'ed together: the rule matches when the current
+	// time falls in any of them. A single empty interval ({}) matches
+	// every time, which is how you write an unconditional base rule.
+	TimeIntervals []RuleInterval `yaml:"time_intervals"`
+
+	// name and action are Name and Action, resolved during loading.
+	name   string `yaml:"-"`
+	action Action `yaml:"-"`
+}
+
+// RuleInterval is an Alertmanager time interval. It exists only to catch an
+// `action` written one level too deep; the action belongs on the rule, since
+// the rule is the unit that matches.
+type RuleInterval struct {
+	timeinterval.TimeInterval `yaml:",inline"`
+
+	StrayAction      string `yaml:"action"`
+	StrayActionUpper string `yaml:"Action"`
 }
 
 // Decision is the outcome of evaluating a config at a point in time.
@@ -138,25 +194,71 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	var cfg Config
-	// Deliberately not UnmarshalStrict: Alertmanager-flavoured configs in
-	// the wild carry annotation keys (for example `Action: deny`) that are
-	// not part of the schema, and rejecting them would be surprising.
+	// Deliberately not UnmarshalStrict: unknown keys elsewhere in the
+	// document are tolerated. The keys that would actually change a
+	// decision if ignored are caught explicitly in resolve().
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return nil, fmt.Errorf("parsing config %s: %w", path, err)
 	}
 
-	if err := cfg.applyTimezone(); err != nil {
-		return nil, err
-	}
-	if err := cfg.validate(); err != nil {
+	if err := cfg.resolve(); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
 }
 
-// applyTimezone resolves the top-level timezone and uses it as the default
+// resolve fills in the derived fields and rejects configs that would otherwise
+// produce a silent or misleading decision.
+func (c *Config) resolve() error {
+	if err := c.rejectLegacySchema(); err != nil {
+		return err
+	}
+	if err := c.resolveDefault(); err != nil {
+		return err
+	}
+	if err := c.resolveTimezone(); err != nil {
+		return err
+	}
+	return c.resolveRules()
+}
+
+// rejectLegacySchema turns a config written for the pre-rules schema into an
+// explicit error, rather than an empty rule chain that denies everything.
+func (c *Config) rejectLegacySchema() error {
+	var stale []string
+	if len(c.LegacyTimeIntervals) > 0 {
+		stale = append(stale, "time_intervals")
+	}
+	if len(c.LegacyActive) > 0 {
+		stale = append(stale, "active_time_intervals")
+	}
+	if len(c.LegacyMute) > 0 {
+		stale = append(stale, "mute_time_intervals")
+	}
+	if len(stale) > 0 {
+		return fmt.Errorf("top-level %s is no longer supported: define `rules` with an `action` each instead",
+			strings.Join(stale, ", "))
+	}
+	return nil
+}
+
+// resolveDefault picks the action used when no rule matches.
+func (c *Config) resolveDefault() error {
+	if c.Default == "" {
+		c.defaultAction = ActionDeny
+		return nil
+	}
+	action, err := parseAction(c.Default)
+	if err != nil {
+		return fmt.Errorf("default: %w", err)
+	}
+	c.defaultAction = action
+	return nil
+}
+
+// resolveTimezone resolves the top-level timezone and uses it as the default
 // location for every interval that does not set `location` itself.
-func (c *Config) applyTimezone() error {
+func (c *Config) resolveTimezone() error {
 	if c.Timezone == "" {
 		return nil
 	}
@@ -164,91 +266,82 @@ func (c *Config) applyTimezone() error {
 	if err != nil {
 		return fmt.Errorf("invalid timezone %q: %w", c.Timezone, err)
 	}
-	for _, named := range c.TimeIntervals {
-		for i := range named.TimeIntervals {
-			if named.TimeIntervals[i].Location == nil {
-				named.TimeIntervals[i].Location = &timeinterval.Location{Location: loc}
+	for _, rule := range c.Rules {
+		for i := range rule.TimeIntervals {
+			if rule.TimeIntervals[i].Location == nil {
+				rule.TimeIntervals[i].Location = &timeinterval.Location{Location: loc}
 			}
 		}
 	}
 	return nil
 }
 
-// validate rejects configs that would otherwise produce a silent or
-// misleading decision.
-func (c *Config) validate() error {
-	seen := make(map[string]bool, len(c.TimeIntervals))
-	for _, named := range c.TimeIntervals {
-		if named.Name == "" {
-			return fmt.Errorf("time_intervals: entry with an empty name")
-		}
-		if seen[named.Name] {
-			return fmt.Errorf("time_intervals: duplicate interval name %q", named.Name)
-		}
-		seen[named.Name] = true
-	}
+// resolveRules names every rule, validates its action and intervals, and
+// rejects duplicate names.
+func (c *Config) resolveRules() error {
+	seen := make(map[string]bool, len(c.Rules))
 
-	for _, ref := range c.ActiveTimeIntervals {
-		if !seen[ref] {
-			return fmt.Errorf("active_time_intervals references undefined time interval %q", ref)
+	for i := range c.Rules {
+		rule := &c.Rules[i]
+
+		rule.name = rule.Name
+		if rule.name == "" {
+			rule.name = fmt.Sprintf("rule[%d]", i)
 		}
-	}
-	for _, ref := range c.MuteTimeIntervals {
-		if !seen[ref] {
-			return fmt.Errorf("mute_time_intervals references undefined time interval %q", ref)
+		if seen[rule.name] {
+			return fmt.Errorf("rules: duplicate rule name %q", rule.name)
+		}
+		seen[rule.name] = true
+
+		action, err := parseAction(rule.Action)
+		if err != nil {
+			return fmt.Errorf("rule %q: %w", rule.name, err)
+		}
+		rule.action = action
+
+		if len(rule.TimeIntervals) == 0 {
+			return fmt.Errorf("rule %q: no time_intervals defined, so it can never match "+
+				"(use `time_intervals: [{}]` for a rule that always matches)", rule.name)
+		}
+		for _, interval := range rule.TimeIntervals {
+			if interval.StrayAction != "" || interval.StrayActionUpper != "" {
+				return fmt.Errorf("rule %q: `action` belongs on the rule, not on an entry "+
+					"under its time_intervals", rule.name)
+			}
 		}
 	}
 	return nil
 }
 
-// Decide applies the deploy policy at the given time. Deploying is allowed
-// when no active window is configured or one of them matches, and no mute
-// window matches.
+// Decide runs the rule chain at the given time. Rules are evaluated in order
+// and the last match wins; when nothing matches, the default action decides.
 func (c *Config) Decide(now time.Time) (Decision, error) {
 	intervener := timeinterval.NewIntervener(c.intervalsByName())
 
-	muted, mutedBy, err := intervener.Mutes(c.MuteTimeIntervals, now)
-	if err != nil {
-		return Decision{}, fmt.Errorf("evaluating mute_time_intervals: %w", err)
-	}
-	if muted {
-		return Decision{Allowed: false, Reason: join(mutedBy)}, nil
-	}
-
-	if len(c.ActiveTimeIntervals) == 0 {
-		return Decision{Allowed: true, Reason: "no deploy window configured"}, nil
-	}
-
-	inWindow, activeIn, err := intervener.Mutes(c.ActiveTimeIntervals, now)
-	if err != nil {
-		return Decision{}, fmt.Errorf("evaluating active_time_intervals: %w", err)
-	}
-	if !inWindow {
-		return Decision{Allowed: false, Reason: "no active window matched"}, nil
-	}
-	return Decision{Allowed: true, Reason: join(activeIn)}, nil
-}
-
-// intervalsByName shapes the config for timeinterval.NewIntervener.
-func (c *Config) intervalsByName() map[string][]timeinterval.TimeInterval {
-	byName := make(map[string][]timeinterval.TimeInterval, len(c.TimeIntervals))
-	for _, named := range c.TimeIntervals {
-		byName[named.Name] = named.TimeIntervals
-	}
-	return byName
-}
-
-// join renders the matched interval names deterministically; Mutes can report
-// the same name once per matching sub-interval.
-func join(names []string) string {
-	unique := make([]string, 0, len(names))
-	seen := make(map[string]bool, len(names))
-	for _, n := range names {
-		if !seen[n] {
-			seen[n] = true
-			unique = append(unique, n)
+	action, reason := c.defaultAction, reasonNoMatch
+	for _, rule := range c.Rules {
+		matched, _, err := intervener.Mutes([]string{rule.name}, now)
+		if err != nil {
+			return Decision{}, fmt.Errorf("evaluating rule %q: %w", rule.name, err)
+		}
+		if matched {
+			action, reason = rule.action, rule.name
 		}
 	}
-	sort.Strings(unique)
-	return strings.Join(unique, ",")
+
+	return Decision{Allowed: action == ActionAllow, Reason: reason}, nil
+}
+
+// intervalsByName shapes the rules for timeinterval.NewIntervener, keyed by
+// the resolved rule name.
+func (c *Config) intervalsByName() map[string][]timeinterval.TimeInterval {
+	byName := make(map[string][]timeinterval.TimeInterval, len(c.Rules))
+	for _, rule := range c.Rules {
+		intervals := make([]timeinterval.TimeInterval, 0, len(rule.TimeIntervals))
+		for _, interval := range rule.TimeIntervals {
+			intervals = append(intervals, interval.TimeInterval)
+		}
+		byName[rule.name] = intervals
+	}
+	return byName
 }
