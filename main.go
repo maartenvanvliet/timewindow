@@ -1,21 +1,26 @@
-// Command deploy-gate decides whether a production deployment is allowed to
-// run right now, by evaluating a list of rules against the current time.
+// Command timewindow reports whether a point in time is allowed by a policy
+// of time-based rules.
 //
 // Rules work like firewall rules: they are evaluated top to bottom and the
-// last one that matches wins, so a config can layer broad allows first and
+// last one that matches wins, so a policy can layer broad allows first and
 // narrower denies after them. Each rule matches on Prometheus Alertmanager's
 // time_intervals schema.
 //
-// The tool prints two KEY=value lines to stdout so the caller can redirect
-// straight into $GITHUB_OUTPUT, and signals the decision through its exit
-// code:
+// The decision goes to stdout and to the exit status, so it can gate anything
+// a shell can gate:
 //
-//	0 - deployment allowed
-//	1 - deployment denied
-//	2 - config could not be read, parsed or validated
+//	timewindow -quiet || exit 0
+//
+// Exit codes:
+//
+//	0 - allowed
+//	1 - denied
+//	2 - the policy or the arguments could not be used
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -34,17 +39,23 @@ import (
 )
 
 const (
-	// defaultConfigPath is used when -config is not given, so the workflow
-	// step can be a bare `go run .`.
-	defaultConfigPath = ".github/deploy-window.yml"
+	// programName is used for the usage text, the version banner and the
+	// error prefix.
+	programName = "timewindow"
+
+	// defaultConfigPath is where the policy is read from when -config is
+	// not given.
+	defaultConfigPath = "timewindow.yml"
 
 	// reasonNoMatch is reported when no rule matched and the default
 	// action decided the outcome.
 	reasonNoMatch = "no rule matched"
 
-	exitAllowed     = 0
-	exitDenied      = 1
-	exitConfigError = 2
+	exitAllowed = 0
+	exitDenied  = 1
+	// exitError covers an unusable policy and unusable arguments alike:
+	// either way the tool could not answer the question.
+	exitError = 2
 )
 
 // Build metadata. Release binaries set these with -ldflags -X; other builds
@@ -117,8 +128,8 @@ func (b BuildInfo) String() string {
 	if date == "" {
 		date = "unknown"
 	}
-	return fmt.Sprintf("deploy-gate %s\ncommit: %s\nbuilt:  %s\ngo:     %s %s/%s",
-		version, commit, date, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+	return fmt.Sprintf("%s %s\ncommit: %s\nbuilt:  %s\ngo:     %s %s/%s",
+		programName, version, commit, date, runtime.Version(), runtime.GOOS, runtime.GOARCH)
 }
 
 // Action is what a rule does when it matches.
@@ -198,94 +209,191 @@ type RuleInterval struct {
 
 // Decision is the outcome of evaluating a config at a point in time.
 type Decision struct {
-	Allowed bool
-	Reason  string
+	Allowed bool   `json:"allowed"`
+	Reason  string `json:"reason"`
 }
 
 func main() {
-	configPath := flag.String("config", defaultConfigPath, "path to the deploy window config file")
-	showVersion := flag.Bool("version", false, "print version information and exit")
-	flag.Usage = usage
-	flag.Parse()
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+// run is the whole CLI, so that argument handling, output and exit codes can
+// be exercised in tests the same way a caller sees them.
+func run(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet(programName, flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	flags.Usage = func() { usage(stderr, flags) }
+
+	configPath := flags.String("config", defaultConfigPath, "path to the policy file, or - for stdin")
+	at := flags.String("at", "", "evaluate at this RFC 3339 time instead of now")
+	format := flags.String("format", string(FormatKeyValue), "output format: key-value or json")
+	quiet := flags.Bool("quiet", false, "print nothing; report the decision through the exit status only")
+	showVersion := flags.Bool("version", false, "print version information and exit")
+
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return exitAllowed
+		}
+		return exitError
+	}
 
 	if *showVersion {
 		stamped, ok := debug.ReadBuildInfo()
-		fmt.Fprintln(os.Stdout, resolveBuildInfo(version, commit, date, stamped, ok))
-		os.Exit(exitAllowed)
+		fmt.Fprintln(stdout, resolveBuildInfo(version, commit, date, stamped, ok))
+		return exitAllowed
 	}
 
-	decision, err := Evaluate(*configPath, time.Now())
+	decision, err := evaluate(*configPath, *at, *format, stdout, *quiet)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "deploy-gate: %v\n", err)
-		os.Exit(exitConfigError)
+		fmt.Fprintf(stderr, "%s: %v\n", programName, err)
+		return exitError
 	}
-
-	writeOutput(os.Stdout, decision)
 	if !decision.Allowed {
-		os.Exit(exitDenied)
+		return exitDenied
 	}
-	os.Exit(exitAllowed)
+	return exitAllowed
 }
 
-// usage documents the exit codes, which are the part of this CLI a caller is
-// most likely to get wrong.
-func usage() {
-	fmt.Fprint(flag.CommandLine.Output(), `deploy-gate decides whether a production deployment may run right now.
+// evaluate resolves the arguments, makes the decision and reports it.
+func evaluate(configPath, at, format string, stdout io.Writer, quiet bool) (Decision, error) {
+	when, err := resolveTime(at)
+	if err != nil {
+		return Decision{}, err
+	}
+	outputFormat, err := ParseFormat(format)
+	if err != nil {
+		return Decision{}, err
+	}
+
+	decision, err := Evaluate(configPath, when)
+	if err != nil {
+		return Decision{}, err
+	}
+
+	if !quiet {
+		if err := writeOutput(stdout, decision, outputFormat); err != nil {
+			return Decision{}, err
+		}
+	}
+	return decision, nil
+}
+
+// resolveTime turns the -at flag into the instant to evaluate.
+func resolveTime(at string) (time.Time, error) {
+	if at == "" {
+		return time.Now(), nil
+	}
+	when, err := time.Parse(time.RFC3339, at)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("-at: %q is not an RFC 3339 time such as 2026-12-24T10:00:00+01:00", at)
+	}
+	return when, nil
+}
+
+// usage keeps the exit codes in front of the reader, since they are the part
+// of this tool a caller is most likely to get wrong.
+func usage(w io.Writer, flags *flag.FlagSet) {
+	fmt.Fprintf(w, `%s reports whether a point in time is allowed by a policy of
+time-based rules. Rules are evaluated top to bottom and the last match wins.
 
 Usage:
-  deploy-gate [-config path]
-
-It prints two KEY=value lines on stdout, ready for $GITHUB_OUTPUT:
-
-  allowed=true|false
-  reason=<name of the deciding rule | "no rule matched">
+  %s [flags]
 
 Exit codes:
   0  allowed
   1  denied
-  2  the config is missing, unparseable or invalid (error on stderr)
+  2  the policy or the arguments could not be used (message on stderr)
+
+The exit status is the whole answer, so the decision can gate a shell:
+
+  %s -quiet && ./release.sh
 
 Flags:
-`)
-	flag.PrintDefaults()
+`, programName, programName, programName)
+	flags.PrintDefaults()
 }
 
-// writeOutput emits the decision as $GITHUB_OUTPUT-compatible KEY=value lines.
-func writeOutput(w io.Writer, d Decision) {
-	fmt.Fprintf(w, "allowed=%t\n", d.Allowed)
-	fmt.Fprintf(w, "reason=%s\n", sanitize(d.Reason))
+// Format is how a decision is rendered on stdout.
+type Format string
+
+const (
+	// FormatKeyValue writes `key=value` lines. It suits shell `eval` and
+	// appending to a CI step's output file.
+	FormatKeyValue Format = "key-value"
+
+	// FormatJSON writes one JSON object.
+	FormatJSON Format = "json"
+)
+
+// ParseFormat validates an output format name.
+func ParseFormat(s string) (Format, error) {
+	switch Format(strings.ToLower(strings.TrimSpace(s))) {
+	case FormatKeyValue:
+		return FormatKeyValue, nil
+	case FormatJSON:
+		return FormatJSON, nil
+	default:
+		return "", fmt.Errorf("-format: must be %q or %q, got %q", FormatKeyValue, FormatJSON, s)
+	}
 }
 
-// sanitize keeps a reason on a single line; a multi-line value would break the
-// KEY=value protocol GitHub Actions expects.
+// writeOutput renders the decision in the requested format.
+func writeOutput(w io.Writer, d Decision, format Format) error {
+	switch format {
+	case FormatJSON:
+		encoder := json.NewEncoder(w)
+		encoder.SetEscapeHTML(false)
+		return encoder.Encode(d)
+	default:
+		_, err := fmt.Fprintf(w, "allowed=%t\nreason=%s\n", d.Allowed, sanitize(d.Reason))
+		return err
+	}
+}
+
+// sanitize keeps a reason on a single line, so one `key=value` record cannot
+// spill into the next.
 func sanitize(s string) string {
 	return strings.NewReplacer("\r", " ", "\n", " ").Replace(s)
 }
 
-// Evaluate loads the config at path and decides whether deploying is allowed
-// at the given time. A non-nil error means the config is unusable; callers
-// must never treat that as "allowed".
-func Evaluate(path string, now time.Time) (Decision, error) {
+// Evaluate loads the policy at path and decides what it says about the given
+// time. A non-nil error means the policy is unusable; callers must never treat
+// that as "allowed".
+func Evaluate(path string, when time.Time) (Decision, error) {
 	cfg, err := LoadConfig(path)
 	if err != nil {
 		return Decision{}, err
 	}
-	return cfg.Decide(now)
+	return cfg.Decide(when)
 }
 
-// LoadConfig reads, parses and validates a config file.
+// LoadConfig reads, parses and validates a policy file. A path of "-" reads
+// stdin, so a policy can be piped in or generated on the fly.
 func LoadConfig(path string) (*Config, error) {
-	raw, err := os.ReadFile(path)
+	var (
+		raw []byte
+		err error
+	)
+	if path == "-" {
+		raw, err = io.ReadAll(os.Stdin)
+	} else {
+		raw, err = os.ReadFile(path)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("reading config: %w", err)
 	}
+	return ParseConfig(raw, path)
+}
 
+// ParseConfig parses and validates a policy document. source names it in error
+// messages.
+func ParseConfig(raw []byte, source string) (*Config, error) {
 	var cfg Config
 	// Deliberately not UnmarshalStrict: unknown keys elsewhere in the
 	// document are tolerated. The keys that would actually change a
 	// decision if ignored are caught explicitly in resolve().
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
-		return nil, fmt.Errorf("parsing config %s: %w", path, err)
+		return nil, fmt.Errorf("parsing config %s: %w", source, err)
 	}
 
 	if err := cfg.resolve(); err != nil {

@@ -1,8 +1,16 @@
-# deploy-gate
+# timewindow
 
-A small Go CLI that decides whether a production deployment is allowed to run
-right now. It is meant to be a step in a GitHub Actions workflow, in front of a
-deploy job.
+A small Go CLI that answers one question: **is this point in time allowed by a
+policy of time-based rules?** It reports the answer on stdout and in its exit
+status, so a shell, a Makefile, a cron job or a CI step can gate on it.
+
+```console
+$ timewindow
+allowed=false
+reason=friday-afternoon
+$ echo $?
+1
+```
 
 Policy is a list of **rules**, evaluated like firewall rules: top to bottom,
 **last match wins**. That lets you start from a broad allow and layer narrower
@@ -15,9 +23,9 @@ location are parsed by `github.com/prometheus/alertmanager/timeinterval`
 itself, and matching is done by `timeinterval.NewIntervener(...).Mutes(...)`.
 None of that logic is reimplemented here.
 
-## Config
+## Policy
 
-`.github/deploy-window.yml`:
+`timewindow.yml`, the default `-config` path:
 
 ```yaml
 timezone: Europe/Amsterdam
@@ -99,36 +107,57 @@ The IANA database is embedded (`time/tzdata`), so `Europe/Amsterdam` resolves
 even on a minimal CI image without `/usr/share/zoneinfo`, and intervals are
 matched against local wall-clock time across DST switches.
 
-## Behaviour
+## Usage
 
 ```
-deploy-gate [-config .github/deploy-window.yml]
+timewindow [-config path] [-at time] [-format key-value|json] [-quiet] [-version]
 ```
 
-Two `KEY=value` lines on stdout, ready to be redirected into `$GITHUB_OUTPUT`:
+| Flag | Meaning |
+| --- | --- |
+| `-config` | Policy file. Default `timewindow.yml`; `-` reads stdin. |
+| `-at` | Evaluate an RFC 3339 instant instead of now — handy for asking "what will this policy say on Christmas Eve?". |
+| `-format` | `key-value` (default) or `json`. |
+| `-quiet` | Print nothing; answer with the exit status alone. |
 
-```
-allowed=true|false
-reason=<name of the deciding rule | "no rule matched">
+The decision is reported twice, so callers can take whichever is convenient.
+On stdout:
+
+```console
+$ timewindow -at 2026-12-24T10:00:00+01:00
+allowed=false
+reason=christmas-freeze
+
+$ timewindow -at 2026-12-24T10:00:00+01:00 -format json
+{"allowed":false,"reason":"christmas-freeze"}
 ```
 
-Exit codes:
+...and in the exit status:
 
 | Code | Meaning |
 | --- | --- |
 | `0` | Allowed. |
 | `1` | Denied. |
-| `2` | Config missing, unparseable or invalid. The error goes to stderr. |
+| `2` | The policy or the arguments could not be used. The message goes to stderr. |
 
-A config error never degrades to "allowed": it exits `2` with a message on
-stderr, so a broken config fails the workflow instead of waving a deploy
-through. Configs are rejected — rather than quietly doing nothing — when a rule
-has no action or an unknown one, when a rule defines no intervals (it could
-never match), when two rules share a name, and when `action` is written one
-level too deep, under a `time_intervals` entry instead of on the rule.
+Which makes it a plain shell predicate:
 
-There is no override flag or env var: the tool only answers the question. If
-you want a break-glass path, skip the call in the shell — see below.
+```sh
+timewindow -quiet && ./release.sh
+```
+
+The `reason` is the name of the rule that decided, or `no rule matched` when
+the policy fell through to its default.
+
+A broken policy never degrades to "allowed": it exits `2` with a message on
+stderr, distinct from a real denial. Policies are rejected — rather than
+quietly doing nothing — when a rule has no action or an unknown one, when a
+rule defines no intervals (it could never match), when two rules share a name,
+and when `action` is written one level too deep, under a `time_intervals` entry
+instead of on the rule.
+
+There is no override flag or env var: the tool only answers the question.
+A break-glass path belongs to the caller, which can simply not call it.
 
 ## Install
 
@@ -141,32 +170,30 @@ VERSION=v1.0.0
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 
-curl -sSfL "https://github.com/maartenvanvliet/timewindow/releases/download/${VERSION}/deploy-gate_${VERSION}_${OS}_${ARCH}.tar.gz" \
-  | tar xz deploy-gate
+curl -sSfL "https://github.com/maartenvanvliet/timewindow/releases/download/${VERSION}/timewindow_${VERSION}_${OS}_${ARCH}.tar.gz" \
+  | tar xz timewindow
 ```
 
-The archives are flat, so `tar xz deploy-gate` pulls out just the binary. To
+The archives are flat, so `tar xz timewindow` pulls out just the binary. To
 check it against the published checksums first:
 
 ```sh
-curl -sSfLO "https://github.com/maartenvanvliet/timewindow/releases/download/${VERSION}/deploy-gate_${VERSION}_${OS}_${ARCH}.tar.gz"
+curl -sSfLO "https://github.com/maartenvanvliet/timewindow/releases/download/${VERSION}/timewindow_${VERSION}_${OS}_${ARCH}.tar.gz"
 curl -sSfL "https://github.com/maartenvanvliet/timewindow/releases/download/${VERSION}/checksums.txt" \
-  | grep "deploy-gate_${VERSION}_${OS}_${ARCH}.tar.gz" | sha256sum -c -
+  | grep "timewindow_${VERSION}_${OS}_${ARCH}.tar.gz" | sha256sum -c -
 ```
 
-From source, either of:
+From source:
 
 ```sh
-go build -o deploy-gate .                                  # in a checkout
-go install github.com/maartenvanvliet/timewindow@latest    # installs as `timewindow`
+go install github.com/maartenvanvliet/timewindow@latest
 ```
 
-`go install` names the binary after the module, so it lands as `timewindow`
-rather than `deploy-gate`. Every binary reports its own provenance:
+Every binary reports its own provenance:
 
 ```console
-$ deploy-gate -version
-deploy-gate v1.0.0
+$ timewindow -version
+timewindow v1.0.0
 commit: 0123456789ab
 built:  2026-08-02T10:00:00Z
 go:     go1.22.0 linux/amd64
@@ -176,24 +203,66 @@ Release builds get that from `-ldflags`; `go build` and `go install` binaries
 fall back to the VCS data the Go toolchain stamps in, and mark a build from a
 dirty tree as such.
 
-## GitHub Actions
+## Integrations
+
+Nothing about the tool is specific to CI — it is a predicate with an exit
+status, so it composes wherever that works.
+
+**A shell script:**
+
+```sh
+timewindow -quiet || { echo "outside the window, skipping"; exit 0; }
+./release.sh
+```
+
+**A Makefile:**
+
+```make
+deploy:
+	@timewindow -quiet || { echo "outside the deploy window"; exit 1; }
+	./deploy.sh
+```
+
+**cron**, to run a job hourly but only while the policy allows it:
+
+```cron
+0 * * * * timewindow -quiet -config /etc/timewindow.yml && /usr/local/bin/run-batch
+```
+
+**A one-off question**, without touching a file at all:
+
+```console
+$ timewindow -config - -at 2026-12-24T10:00:00+01:00 <<'EOF'
+rules:
+  - name: christmas-freeze
+    action: deny
+    time_intervals: [{ months: ['december'], days_of_month: ['22:31'] }]
+EOF
+allowed=false
+reason=christmas-freeze
+```
+
+### GitHub Actions
+
+The `key=value` output is the format `$GITHUB_OUTPUT` wants, so a step can
+append to it directly:
 
 ```yaml
-- name: Install deploy-gate
+- name: Install timewindow
   run: |
-    curl -sSfL https://github.com/maartenvanvliet/timewindow/releases/download/v1.0.0/deploy-gate_v1.0.0_linux_amd64.tar.gz \
-      | tar xz deploy-gate
+    curl -sSfL https://github.com/maartenvanvliet/timewindow/releases/download/v1.0.0/timewindow_v1.0.0_linux_amd64.tar.gz \
+      | tar xz timewindow
 - id: check
   run: |
     set +e
-    ./deploy-gate >> "$GITHUB_OUTPUT"
+    ./timewindow >> "$GITHUB_OUTPUT"
     code=$?
     # 0 = allowed, 1 = denied: both are valid answers, keep going.
-    # 2 = broken config: fail the workflow.
+    # 2 = broken policy: fail the workflow.
     [ "$code" -le 1 ] || exit "$code"
 ```
 
-Then gate the deploy job on the step output:
+Then gate the job on the step output:
 
 ```yaml
 - name: Deploy to ECS
@@ -202,22 +271,11 @@ Then gate the deploy job on the step output:
 ```
 
 Pin the version in the URL rather than tracking `latest`, so a new release
-cannot change a deploy decision without a commit to your workflow.
+cannot change a decision without a commit to your workflow.
 
-### Break-glass
-
-Overrides belong to the caller, not the gate. To let a human force a deploy,
-take a `workflow_dispatch` input and skip the check:
-
-```yaml
-on:
-  workflow_dispatch:
-    inputs:
-      force:
-        description: Deploy even outside the window
-        type: boolean
-        default: false
-```
+To let a human force a run, take a `workflow_dispatch` input and skip the
+check — the override belongs to the caller, where it is recorded against the
+workflow run:
 
 ```yaml
 - id: check
@@ -229,27 +287,15 @@ on:
       exit 0
     fi
     set +e
-    ./deploy-gate >> "$GITHUB_OUTPUT"
+    ./timewindow >> "$GITHUB_OUTPUT"
     code=$?
     [ "$code" -le 1 ] || exit "$code"
 ```
 
-That keeps the override where it can be seen and audited — in the workflow
-run's inputs — instead of in an environment variable that anything on the
-runner could have set.
-
-In a repo that already vendors this tool, you can skip the download:
-
-```yaml
-- uses: actions/setup-go@v5
-  with: { go-version: '1.22' }
-- id: check
-  run: go run . >> "$GITHUB_OUTPUT"
-```
-
-That form cannot tell "correctly skipped" from "broken config", though —
-`go run` reports every non-zero program exit as `1`. Use the released binary,
-or `go build` first, when you need the exit codes intact.
+In a repo that vendors this tool, `go run . >> "$GITHUB_OUTPUT"` works too, but
+it cannot tell "correctly skipped" from "broken policy" — `go run` reports
+every non-zero program exit as `1`. Use the released binary, or `go build`
+first, when you need the exit codes intact.
 
 ## Releasing
 
@@ -283,20 +329,26 @@ go test ./...
 ```
 
 Table-driven cases cover office hours, the Friday cutoff, the weekend, both
-halves of the Christmas freeze, the DST switch, and the engine itself: a later deny beating an earlier allow, the same two rules
-swapped producing the opposite outcome, an allow punching a hole in an earlier
-deny, the always-matching empty interval, and both defaults. Config errors are
-covered by their own table — malformed YAML, the pre-rules schema, a bad
-timezone, bad or missing actions, a rule with no intervals, duplicate names and
-a misplaced nested `action`. A third table covers the version stamping: link
-time values winning over the toolchain's, a `go install` build describing
-itself from the VCS stamps, and a dirty tree being flagged.
+halves of the Christmas freeze, the DST switch, and the engine itself: a later
+deny beating an earlier allow, the same two rules swapped producing the
+opposite outcome, an allow punching a hole in an earlier deny, the
+always-matching empty interval, and both defaults. Policy errors are covered by
+their own table — malformed YAML, the pre-rules schema, a bad timezone, bad or
+missing actions, a rule with no intervals, duplicate names and a misplaced
+nested `action`.
+
+`run` is the entire CLI, so the argument handling is tested the way a caller
+sees it: arguments in, stdout/stderr and an exit code out. That table covers
+both output formats, `-quiet`, a bad `-at` and `-format`, an unknown flag, and
+that `-h` is not an error. A third table covers the version stamping: link time
+values winning over the toolchain's, a `go install` build describing itself
+from the VCS stamps, and a dirty tree being flagged.
 
 ## Notes
 
 - The pre-rules schema (top-level `time_intervals` with
   `active_time_intervals` / `mute_time_intervals`) is rejected with a
-  migration error rather than ignored, so an old config cannot silently
+  migration error rather than ignored, so an old policy cannot silently
   evaluate to an empty rule chain.
 - Parsing is non-strict, so unknown keys elsewhere in the document are
   tolerated. Note that YAML key matching is case-sensitive here: `Action:` is
@@ -306,4 +358,4 @@ itself from the VCS stamps, and a dirty tree being flagged.
   release whose module still builds on Go 1.22 while exposing
   `Mutes(names []string, now time.Time) (bool, []string, error)`. Later
   releases (`v0.29.0`+) require Go 1.24 or newer; bump `go-version` in the
-  workflow above if you upgrade.
+  release workflow if you upgrade.

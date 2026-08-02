@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-BINARY=deploy-gate
+BINARY=timewindow
 DIST=${DIST:-dist}
 
 VERSION=${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}
@@ -63,7 +63,7 @@ for target in $TARGETS; do
 
 	# Archive members sit at the root, with no wrapping directory, so a
 	# caller can pull out just the binary:
-	#   curl -sSfL <url> | tar xz deploy-gate
+	#   curl -sSfL <url> | tar xz timewindow
 	contents=("$exe")
 	for extra in README.md LICENSE; do
 		if [ -f "$extra" ]; then

@@ -120,7 +120,7 @@ func amsterdam(t *testing.T, value string) time.Time {
 // writeConfig writes contents to a temp file and returns its path.
 func writeConfig(t *testing.T, contents string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "deploy-window.yml")
+	path := filepath.Join(t.TempDir(), "timewindow.yml")
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatalf("writing config: %v", err)
 	}
@@ -436,9 +436,10 @@ func TestEvaluateMissingConfig(t *testing.T) {
 	}
 }
 
-// TestShippedConfig guards the config committed at .github/deploy-window.yml.
+// TestShippedConfig guards the example policy committed at timewindow.yml,
+// which is also the default -config path.
 func TestShippedConfig(t *testing.T) {
-	cfg, err := LoadConfig(filepath.Join(".github", "deploy-window.yml"))
+	cfg, err := LoadConfig(defaultConfigPath)
 	if err != nil {
 		t.Fatalf("LoadConfig() error = %v", err)
 	}
@@ -469,12 +470,201 @@ func TestShippedConfig(t *testing.T) {
 }
 
 func TestWriteOutput(t *testing.T) {
-	var buf bytes.Buffer
-	writeOutput(&buf, Decision{Allowed: false, Reason: "christmas\nfreeze"})
+	tests := []struct {
+		name     string
+		decision Decision
+		format   Format
+		want     string
+	}{
+		{
+			name:     "key-value",
+			decision: Decision{Allowed: true, Reason: "office-hours"},
+			format:   FormatKeyValue,
+			want:     "allowed=true\nreason=office-hours\n",
+		},
+		{
+			name:     "key-value keeps one record per line",
+			decision: Decision{Reason: "christmas\nfreeze"},
+			format:   FormatKeyValue,
+			want:     "allowed=false\nreason=christmas freeze\n",
+		},
+		{
+			name:     "json",
+			decision: Decision{Allowed: false, Reason: "friday-afternoon"},
+			format:   FormatJSON,
+			want:     `{"allowed":false,"reason":"friday-afternoon"}` + "\n",
+		},
+	}
 
-	want := "allowed=false\nreason=christmas freeze\n"
-	if buf.String() != want {
-		t.Errorf("writeOutput() = %q, want %q", buf.String(), want)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			if err := writeOutput(&buf, tc.decision, tc.format); err != nil {
+				t.Fatalf("writeOutput() error = %v", err)
+			}
+			if buf.String() != tc.want {
+				t.Errorf("writeOutput() = %q, want %q", buf.String(), tc.want)
+			}
+		})
+	}
+}
+
+func TestParseFormat(t *testing.T) {
+	for _, in := range []string{"key-value", "KEY-VALUE", " json "} {
+		if _, err := ParseFormat(in); err != nil {
+			t.Errorf("ParseFormat(%q) error = %v", in, err)
+		}
+	}
+	if _, err := ParseFormat("yaml"); err == nil {
+		t.Error("ParseFormat(\"yaml\") = nil error, want an error")
+	}
+}
+
+func TestResolveTime(t *testing.T) {
+	got, err := resolveTime("2026-12-24T10:00:00+01:00")
+	if err != nil {
+		t.Fatalf("resolveTime() error = %v", err)
+	}
+	if want := time.Date(2026, 12, 24, 9, 0, 0, 0, time.UTC); !got.Equal(want) {
+		t.Errorf("resolveTime() = %v, want %v", got, want)
+	}
+
+	before := time.Now()
+	got, err = resolveTime("")
+	if err != nil {
+		t.Fatalf("resolveTime(\"\") error = %v", err)
+	}
+	if got.Before(before) {
+		t.Errorf("resolveTime(\"\") = %v, want a time at or after %v", got, before)
+	}
+
+	if _, err := resolveTime("christmas"); err == nil {
+		t.Error("resolveTime(\"christmas\") = nil error, want an error")
+	}
+}
+
+// TestRun drives the CLI the way a caller does: arguments in, streams and an
+// exit code out.
+func TestRun(t *testing.T) {
+	policy := writeConfig(t, officeConfig)
+
+	tests := []struct {
+		name       string
+		args       []string
+		wantCode   int
+		wantStdout string
+		wantStderr string // substring
+	}{
+		{
+			name:       "allowed",
+			args:       []string{"-config", policy, "-at", "2026-03-11T10:30:00+01:00"},
+			wantCode:   exitAllowed,
+			wantStdout: "allowed=true\nreason=office-hours\n",
+		},
+		{
+			name:       "denied",
+			args:       []string{"-config", policy, "-at", "2026-03-13T14:01:00+01:00"},
+			wantCode:   exitDenied,
+			wantStdout: "allowed=false\nreason=friday-afternoon\n",
+		},
+		{
+			name:       "json",
+			args:       []string{"-config", policy, "-at", "2026-03-11T10:30:00+01:00", "-format", "json"},
+			wantCode:   exitAllowed,
+			wantStdout: `{"allowed":true,"reason":"office-hours"}` + "\n",
+		},
+		{
+			name:     "quiet says it with the exit code alone",
+			args:     []string{"-config", policy, "-at", "2026-03-14T11:00:00+01:00", "-quiet"},
+			wantCode: exitDenied,
+		},
+		{
+			name:       "a missing policy is an error, not a denial",
+			args:       []string{"-config", filepath.Join(t.TempDir(), "absent.yml")},
+			wantCode:   exitError,
+			wantStderr: "timewindow: reading config",
+		},
+		{
+			name:       "an unusable -at is an error",
+			args:       []string{"-config", policy, "-at", "christmas"},
+			wantCode:   exitError,
+			wantStderr: "-at:",
+		},
+		{
+			name:       "an unusable -format is an error",
+			args:       []string{"-config", policy, "-format", "yaml"},
+			wantCode:   exitError,
+			wantStderr: "-format:",
+		},
+		{
+			name:       "an unknown flag is an error",
+			args:       []string{"-nope"},
+			wantCode:   exitError,
+			wantStderr: "not defined",
+		},
+		{
+			name:     "help is not an error",
+			args:     []string{"-h"},
+			wantCode: exitAllowed,
+			// Usage goes to stderr, leaving stdout for the decision.
+			wantStderr: "Exit codes:",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+
+			code := run(tc.args, &stdout, &stderr)
+
+			if code != tc.wantCode {
+				t.Errorf("run() = %d, want %d (stderr: %s)", code, tc.wantCode, stderr.String())
+			}
+			if stdout.String() != tc.wantStdout {
+				t.Errorf("stdout = %q, want %q", stdout.String(), tc.wantStdout)
+			}
+			if tc.wantStderr != "" && !strings.Contains(stderr.String(), tc.wantStderr) {
+				t.Errorf("stderr = %q, want it to contain %q", stderr.String(), tc.wantStderr)
+			}
+			if tc.wantStderr == "" && stderr.Len() > 0 {
+				t.Errorf("stderr = %q, want it empty", stderr.String())
+			}
+		})
+	}
+}
+
+func TestRunVersion(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	if code := run([]string{"-version"}, &stdout, &stderr); code != exitAllowed {
+		t.Errorf("run(-version) = %d, want %d", code, exitAllowed)
+	}
+	if !strings.HasPrefix(stdout.String(), "timewindow ") {
+		t.Errorf("stdout = %q, want it to start with the program name", stdout.String())
+	}
+	if stderr.Len() > 0 {
+		t.Errorf("stderr = %q, want it empty", stderr.String())
+	}
+}
+
+// TestParseConfigFromBytes covers the path -config - uses, where the policy
+// never touches the filesystem.
+func TestParseConfigFromBytes(t *testing.T) {
+	cfg, err := ParseConfig([]byte(officeConfig), "stdin")
+	if err != nil {
+		t.Fatalf("ParseConfig() error = %v", err)
+	}
+
+	got, err := cfg.Decide(amsterdam(t, "2026-03-11 10:30"))
+	if err != nil {
+		t.Fatalf("Decide() error = %v", err)
+	}
+	if !got.Allowed || got.Reason != "office-hours" {
+		t.Errorf("Decide() = %+v, want allowed by office-hours", got)
+	}
+
+	if _, err := ParseConfig([]byte("rules: ["), "stdin"); err == nil {
+		t.Error("ParseConfig() with broken YAML = nil error, want an error")
 	}
 }
 
@@ -543,7 +733,7 @@ func TestResolveBuildInfo(t *testing.T) {
 
 func TestBuildInfoString(t *testing.T) {
 	got := BuildInfo{Version: "v1.2.3", Commit: "abcdef123456", Date: "2026-08-02T10:00:00Z"}.String()
-	for _, want := range []string{"deploy-gate v1.2.3", "commit: abcdef123456", "built:  2026-08-02T10:00:00Z"} {
+	for _, want := range []string{"timewindow v1.2.3", "commit: abcdef123456", "built:  2026-08-02T10:00:00Z"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("String() = %q, want it to contain %q", got, want)
 		}
@@ -551,7 +741,7 @@ func TestBuildInfoString(t *testing.T) {
 
 	// Gaps are filled in rather than printed as empty fields.
 	got = BuildInfo{Dirty: true}.String()
-	for _, want := range []string{"deploy-gate dev", "commit: unknown-dirty", "built:  unknown"} {
+	for _, want := range []string{"timewindow dev", "commit: unknown-dirty", "built:  unknown"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("String() = %q, want it to contain %q", got, want)
 		}

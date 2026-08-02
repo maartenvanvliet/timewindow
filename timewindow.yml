@@ -1,3 +1,4 @@
+# Example policy: when is it OK to ship?
 timezone: Europe/Amsterdam
 
 # Action when no rule below matches.
