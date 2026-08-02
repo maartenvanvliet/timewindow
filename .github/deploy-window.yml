@@ -1,0 +1,24 @@
+timezone: Europe/Amsterdam
+
+# Deploying is allowed only inside office-hours, and never inside the
+# christmas-freeze (a mute match wins over an active match).
+active_time_intervals:
+  - office-hours
+mute_time_intervals:
+  - christmas-freeze
+
+time_intervals:
+  - name: office-hours
+    time_intervals:
+      - weekdays: ['monday:thursday']
+        times: [{ start_time: '09:00', end_time: '18:00' }]
+      - weekdays: ['friday']
+        times: [{ start_time: '09:00', end_time: '14:00' }]
+  - name: christmas-freeze
+    time_intervals:
+      - months: ['december']
+        days_of_month: ['22:31']
+        Action: deny
+      - months: ['january']
+        days_of_month: ['1:2']
+        Action: deny
