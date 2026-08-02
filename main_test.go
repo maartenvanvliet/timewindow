@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
@@ -504,6 +505,86 @@ func TestWriteOutput(t *testing.T) {
 	want := "allowed=false\nreason=christmas freeze\n"
 	if buf.String() != want {
 		t.Errorf("writeOutput() = %q, want %q", buf.String(), want)
+	}
+}
+
+func TestResolveBuildInfo(t *testing.T) {
+	stamped := &debug.BuildInfo{
+		Main: debug.Module{Version: "v0.9.0"},
+		Settings: []debug.BuildSetting{
+			{Key: "vcs.revision", Value: "0123456789abcdef0123456789abcdef01234567"},
+			{Key: "vcs.time", Value: "2026-08-01T09:00:00Z"},
+			{Key: "vcs.modified", Value: "false"},
+		},
+	}
+
+	tests := []struct {
+		name                  string
+		version, commit, date string
+		stamped               *debug.BuildInfo
+		ok                    bool
+		want                  BuildInfo
+	}{
+		{
+			name:    "ldflags win over the toolchain stamps",
+			version: "v1.2.3", commit: "abcdef123456", date: "2026-08-02T10:00:00Z",
+			stamped: stamped, ok: true,
+			want: BuildInfo{Version: "v1.2.3", Commit: "abcdef123456", Date: "2026-08-02T10:00:00Z"},
+		},
+		{
+			name:    "a go install build describes itself from the stamps",
+			version: "dev",
+			stamped: stamped, ok: true,
+			want: BuildInfo{Version: "v0.9.0", Commit: "0123456789ab", Date: "2026-08-01T09:00:00Z"},
+		},
+		{
+			name:    "a dirty tree is flagged",
+			version: "dev",
+			stamped: &debug.BuildInfo{Settings: []debug.BuildSetting{
+				{Key: "vcs.revision", Value: "0123456789abcdef"},
+				{Key: "vcs.modified", Value: "true"},
+			}},
+			ok:   true,
+			want: BuildInfo{Version: "dev", Commit: "0123456789ab", Dirty: true},
+		},
+		{
+			name:    "no build info at all",
+			version: "dev",
+			stamped: nil, ok: false,
+			want: BuildInfo{Version: "dev"},
+		},
+		{
+			name:    "an unstamped devel build stays dev",
+			version: "dev",
+			stamped: &debug.BuildInfo{Main: debug.Module{Version: "(devel)"}}, ok: true,
+			want: BuildInfo{Version: "dev"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveBuildInfo(tc.version, tc.commit, tc.date, tc.stamped, tc.ok)
+			if got != tc.want {
+				t.Errorf("resolveBuildInfo() = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildInfoString(t *testing.T) {
+	got := BuildInfo{Version: "v1.2.3", Commit: "abcdef123456", Date: "2026-08-02T10:00:00Z"}.String()
+	for _, want := range []string{"deploy-gate v1.2.3", "commit: abcdef123456", "built:  2026-08-02T10:00:00Z"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("String() = %q, want it to contain %q", got, want)
+		}
+	}
+
+	// Gaps are filled in rather than printed as empty fields.
+	got = BuildInfo{Dirty: true}.String()
+	for _, want := range []string{"deploy-gate dev", "commit: unknown-dirty", "built:  unknown"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("String() = %q, want it to contain %q", got, want)
+		}
 	}
 }
 

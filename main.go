@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -49,6 +51,80 @@ const (
 	exitDenied      = 1
 	exitConfigError = 2
 )
+
+// Build metadata. Release binaries set these with -ldflags -X; other builds
+// fall back to whatever the Go toolchain stamped into the binary.
+var (
+	version = "dev"
+	commit  = ""
+	date    = ""
+)
+
+// BuildInfo describes the running binary.
+type BuildInfo struct {
+	Version string
+	Commit  string
+	Date    string
+	Dirty   bool
+}
+
+// resolveBuildInfo prefers values injected at link time and fills the gaps
+// from the toolchain's own VCS stamps, so `go build` and `go install` binaries
+// still identify themselves.
+func resolveBuildInfo(version, commit, date string, bi *debug.BuildInfo, ok bool) BuildInfo {
+	out := BuildInfo{Version: version, Commit: commit, Date: date}
+	if !ok || bi == nil {
+		return out
+	}
+
+	if (out.Version == "" || out.Version == "dev") && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		out.Version = bi.Main.Version
+	}
+	for _, setting := range bi.Settings {
+		switch setting.Key {
+		case "vcs.revision":
+			if out.Commit == "" {
+				out.Commit = shortCommit(setting.Value)
+			}
+		case "vcs.time":
+			if out.Date == "" {
+				out.Date = setting.Value
+			}
+		case "vcs.modified":
+			out.Dirty = setting.Value == "true"
+		}
+	}
+	return out
+}
+
+// shortCommit trims a full SHA down to the usual display length.
+func shortCommit(sha string) string {
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
+}
+
+// String renders the -version output.
+func (b BuildInfo) String() string {
+	version := b.Version
+	if version == "" {
+		version = "dev"
+	}
+	commit := b.Commit
+	if commit == "" {
+		commit = "unknown"
+	}
+	if b.Dirty {
+		commit += "-dirty"
+	}
+	date := b.Date
+	if date == "" {
+		date = "unknown"
+	}
+	return fmt.Sprintf("deploy-gate %s\ncommit: %s\nbuilt:  %s\ngo:     %s %s/%s",
+		version, commit, date, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+}
 
 // Action is what a rule does when it matches.
 type Action string
@@ -133,7 +209,15 @@ type Decision struct {
 
 func main() {
 	configPath := flag.String("config", defaultConfigPath, "path to the deploy window config file")
+	showVersion := flag.Bool("version", false, "print version information and exit")
+	flag.Usage = usage
 	flag.Parse()
+
+	if *showVersion {
+		stamped, ok := debug.ReadBuildInfo()
+		fmt.Fprintln(os.Stdout, resolveBuildInfo(version, commit, date, stamped, ok))
+		os.Exit(exitAllowed)
+	}
 
 	decision, err := Evaluate(*configPath, time.Now(), os.Getenv(overrideEnvVar))
 	if err != nil {
@@ -146,6 +230,31 @@ func main() {
 		os.Exit(exitDenied)
 	}
 	os.Exit(exitAllowed)
+}
+
+// usage documents the exit codes, which are the part of this CLI a caller is
+// most likely to get wrong.
+func usage() {
+	fmt.Fprint(flag.CommandLine.Output(), `deploy-gate decides whether a production deployment may run right now.
+
+Usage:
+  deploy-gate [-config path]
+
+It prints two KEY=value lines on stdout, ready for $GITHUB_OUTPUT:
+
+  allowed=true|false
+  reason=<name of the deciding rule | "manual override" | "no rule matched">
+
+Exit codes:
+  0  allowed
+  1  denied
+  2  the config is missing, unparseable or invalid (error on stderr)
+
+Set `+overrideEnvVar+` to a value other than 0/false/no to force a deploy.
+
+Flags:
+`)
+	flag.PrintDefaults()
 }
 
 // writeOutput emits the decision as $GITHUB_OUTPUT-compatible KEY=value lines.

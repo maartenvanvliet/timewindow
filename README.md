@@ -132,13 +132,67 @@ than empty, `0`, `false` or `no` (case-insensitive) counts as set; the config is
 not even read in that case, and the tool prints `allowed=true` /
 `reason=manual override`.
 
+## Install
+
+Each release publishes static binaries for linux, macOS and Windows
+(amd64/arm64), plus a `checksums.txt`. Grab one from the
+[releases page](https://github.com/maartenvanvliet/timewindow/releases), or:
+
+```sh
+VERSION=v1.0.0
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+
+curl -sSfL "https://github.com/maartenvanvliet/timewindow/releases/download/${VERSION}/deploy-gate_${VERSION}_${OS}_${ARCH}.tar.gz" \
+  | tar xz deploy-gate
+```
+
+The archives are flat, so `tar xz deploy-gate` pulls out just the binary. To
+check it against the published checksums first:
+
+```sh
+curl -sSfLO "https://github.com/maartenvanvliet/timewindow/releases/download/${VERSION}/deploy-gate_${VERSION}_${OS}_${ARCH}.tar.gz"
+curl -sSfL "https://github.com/maartenvanvliet/timewindow/releases/download/${VERSION}/checksums.txt" \
+  | grep "deploy-gate_${VERSION}_${OS}_${ARCH}.tar.gz" | sha256sum -c -
+```
+
+From source, either of:
+
+```sh
+go build -o deploy-gate .                                  # in a checkout
+go install github.com/maartenvanvliet/timewindow@latest    # installs as `timewindow`
+```
+
+`go install` names the binary after the module, so it lands as `timewindow`
+rather than `deploy-gate`. Every binary reports its own provenance:
+
+```console
+$ deploy-gate -version
+deploy-gate v1.0.0
+commit: 0123456789ab
+built:  2026-08-02T10:00:00Z
+go:     go1.22.0 linux/amd64
+```
+
+Release builds get that from `-ldflags`; `go build` and `go install` binaries
+fall back to the VCS data the Go toolchain stamps in, and mark a build from a
+dirty tree as such.
+
 ## GitHub Actions
 
 ```yaml
-- uses: actions/setup-go@v5
-  with: { go-version: '1.22' }
+- name: Install deploy-gate
+  run: |
+    curl -sSfL https://github.com/maartenvanvliet/timewindow/releases/download/v1.0.0/deploy-gate_v1.0.0_linux_amd64.tar.gz \
+      | tar xz deploy-gate
 - id: check
-  run: go run . >> "$GITHUB_OUTPUT"
+  run: |
+    set +e
+    ./deploy-gate >> "$GITHUB_OUTPUT"
+    code=$?
+    # 0 = allowed, 1 = denied: both are valid answers, keep going.
+    # 2 = broken config: fail the workflow.
+    [ "$code" -le 1 ] || exit "$code"
 ```
 
 Then gate the deploy job on the step output:
@@ -149,23 +203,46 @@ Then gate the deploy job on the step output:
   run: ./deploy.sh
 ```
 
-Note that `go run .` reports every non-zero program exit as `1`, so the step
-above cannot tell "correctly skipped" from "broken config". Build the binary
-first when you want that distinction:
+Pin the version in the URL rather than tracking `latest`, so a new release
+cannot change a deploy decision without a commit to your workflow.
+
+In a repo that already vendors this tool, you can skip the download:
 
 ```yaml
 - uses: actions/setup-go@v5
   with: { go-version: '1.22' }
 - id: check
-  run: |
-    go build -o deploy-gate .
-    set +e
-    ./deploy-gate >> "$GITHUB_OUTPUT"
-    code=$?
-    # 0 = allowed, 1 = denied: both are valid answers, keep going.
-    # 2 = broken config: fail the workflow.
-    [ "$code" -le 1 ] || exit "$code"
+  run: go run . >> "$GITHUB_OUTPUT"
 ```
+
+That form cannot tell "correctly skipped" from "broken config", though —
+`go run` reports every non-zero program exit as `1`. Use the released binary,
+or `go build` first, when you need the exit codes intact.
+
+## Releasing
+
+Tag and push; [`.github/workflows/release.yml`](.github/workflows/release.yml)
+does the rest:
+
+```sh
+git tag -a v1.0.0 -m 'v1.0.0'
+git push origin v1.0.0
+```
+
+The workflow checks formatting, runs `go vet` and the tests, builds the
+archives and publishes them with generated release notes. A tag containing a
+hyphen (`v1.0.0-rc.1`) is published as a pre-release. Nothing is published if
+the tests fail.
+
+The build itself is a plain script, so a release can be reproduced locally:
+
+```sh
+VERSION=v1.0.0 ./script/build-release.sh   # writes dist/
+```
+
+Builds are `CGO_ENABLED=0 -trimpath`, so the binaries are static and free of
+local paths; `SOURCE_DATE_EPOCH` is honoured if you want the timestamp fixed
+too.
 
 ## Tests
 
@@ -180,7 +257,9 @@ swapped producing the opposite outcome, an allow punching a hole in an earlier
 deny, the always-matching empty interval, and both defaults. Config errors are
 covered by their own table — malformed YAML, the pre-rules schema, a bad
 timezone, bad or missing actions, a rule with no intervals, duplicate names and
-a misplaced nested `action`.
+a misplaced nested `action`. A third table covers the version stamping: link
+time values winning over the toolchain's, a `go install` build describing
+itself from the VCS stamps, and a dirty tree being flagged.
 
 ## Notes
 
