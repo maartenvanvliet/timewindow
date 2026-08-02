@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"flag"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -494,6 +496,24 @@ func TestWriteOutput(t *testing.T) {
 			format:   FormatJSON,
 			want:     `{"allowed":false,"reason":"friday-afternoon"}` + "\n",
 		},
+		{
+			name:     "text",
+			decision: Decision{Allowed: true, Reason: "office-hours"},
+			format:   FormatText,
+			want:     "allowed (office-hours)\n",
+		},
+		{
+			name:     "text when denied",
+			decision: Decision{Allowed: false, Reason: "christmas-freeze"},
+			format:   FormatText,
+			want:     "denied (christmas-freeze)\n",
+		},
+		{
+			name:     "none writes nothing",
+			decision: Decision{Allowed: true, Reason: "office-hours"},
+			format:   FormatNone,
+			want:     "",
+		},
 	}
 
 	for _, tc := range tests {
@@ -510,13 +530,27 @@ func TestWriteOutput(t *testing.T) {
 }
 
 func TestParseFormat(t *testing.T) {
-	for _, in := range []string{"key-value", "KEY-VALUE", " json "} {
+	for _, in := range []string{"none", "key-value", "KEY-VALUE", " json ", "text"} {
 		if _, err := ParseFormat(in); err != nil {
 			t.Errorf("ParseFormat(%q) error = %v", in, err)
 		}
 	}
-	if _, err := ParseFormat("yaml"); err == nil {
-		t.Error("ParseFormat(\"yaml\") = nil error, want an error")
+	for _, in := range []string{"yaml", ""} {
+		if _, err := ParseFormat(in); err == nil {
+			t.Errorf("ParseFormat(%q) = nil error, want an error", in)
+		}
+	}
+}
+
+func TestEnvName(t *testing.T) {
+	for flagName, want := range map[string]string{
+		"config": "TIMEWINDOW_CONFIG",
+		"at":     "TIMEWINDOW_AT",
+		"format": "TIMEWINDOW_FORMAT",
+	} {
+		if got := envName(flagName); got != want {
+			t.Errorf("envName(%q) = %q, want %q", flagName, got, want)
+		}
 	}
 }
 
@@ -543,6 +577,15 @@ func TestResolveTime(t *testing.T) {
 	}
 }
 
+// envFrom turns a map into an EnvLookup, so tests never touch the real
+// environment and can run in parallel.
+func envFrom(vars map[string]string) EnvLookup {
+	return func(name string) (string, bool) {
+		value, ok := vars[name]
+		return value, ok
+	}
+}
+
 // TestRun drives the CLI the way a caller does: arguments in, streams and an
 // exit code out.
 func TestRun(t *testing.T) {
@@ -551,19 +594,24 @@ func TestRun(t *testing.T) {
 	tests := []struct {
 		name       string
 		args       []string
+		env        map[string]string
 		wantCode   int
 		wantStdout string
 		wantStderr string // substring
 	}{
 		{
-			name:       "allowed",
-			args:       []string{"-config", policy, "-at", "2026-03-11T10:30:00+01:00"},
-			wantCode:   exitAllowed,
-			wantStdout: "allowed=true\nreason=office-hours\n",
+			name:     "allowed, and silent by default",
+			args:     []string{"-config", policy, "-at", "2026-03-11T10:30:00+01:00"},
+			wantCode: exitAllowed,
 		},
 		{
-			name:       "denied",
-			args:       []string{"-config", policy, "-at", "2026-03-13T14:01:00+01:00"},
+			name:     "denied, and silent by default",
+			args:     []string{"-config", policy, "-at", "2026-03-13T14:01:00+01:00"},
+			wantCode: exitDenied,
+		},
+		{
+			name:       "key-value",
+			args:       []string{"-config", policy, "-at", "2026-03-13T14:01:00+01:00", "-format", "key-value"},
 			wantCode:   exitDenied,
 			wantStdout: "allowed=false\nreason=friday-afternoon\n",
 		},
@@ -574,9 +622,53 @@ func TestRun(t *testing.T) {
 			wantStdout: `{"allowed":true,"reason":"office-hours"}` + "\n",
 		},
 		{
-			name:     "quiet says it with the exit code alone",
-			args:     []string{"-config", policy, "-at", "2026-03-14T11:00:00+01:00", "-quiet"},
-			wantCode: exitDenied,
+			name:       "text",
+			args:       []string{"-config", policy, "-at", "2026-03-11T10:30:00+01:00", "-format", "text"},
+			wantCode:   exitAllowed,
+			wantStdout: "allowed (office-hours)\n",
+		},
+		{
+			name:       "an explicit none is still silent",
+			args:       []string{"-config", policy, "-at", "2026-03-11T10:30:00+01:00", "-format", "none"},
+			wantCode:   exitAllowed,
+			wantStdout: "",
+		},
+
+		// Environment.
+		{
+			name: "every flag can come from the environment",
+			env: map[string]string{
+				"TIMEWINDOW_CONFIG": policy,
+				"TIMEWINDOW_AT":     "2026-03-11T10:30:00+01:00",
+				"TIMEWINDOW_FORMAT": "text",
+			},
+			wantCode:   exitAllowed,
+			wantStdout: "allowed (office-hours)\n",
+		},
+		{
+			name: "a flag wins over its variable",
+			args: []string{"-format", "json"},
+			env: map[string]string{
+				"TIMEWINDOW_CONFIG": policy,
+				"TIMEWINDOW_AT":     "2026-03-11T10:30:00+01:00",
+				"TIMEWINDOW_FORMAT": "text",
+			},
+			wantCode:   exitAllowed,
+			wantStdout: `{"allowed":true,"reason":"office-hours"}` + "\n",
+		},
+		{
+			name:       "an unusable variable is an error",
+			args:       []string{"-config", policy},
+			env:        map[string]string{"TIMEWINDOW_FORMAT": "yaml"},
+			wantCode:   exitError,
+			wantStderr: "-format:",
+		},
+		{
+			name:       "an unrelated variable is ignored",
+			args:       []string{"-config", policy, "-at", "2026-03-11T10:30:00+01:00"},
+			env:        map[string]string{"TIMEWINDOW_NOPE": "x", "FORMAT": "json"},
+			wantCode:   exitAllowed,
+			wantStdout: "",
 		},
 		{
 			name:       "a missing policy is an error, not a denial",
@@ -597,6 +689,13 @@ func TestRun(t *testing.T) {
 			wantStderr: "-format:",
 		},
 		{
+			name:       "-version is not driven by the environment",
+			args:       []string{"-config", policy, "-at", "2026-03-11T10:30:00+01:00"},
+			env:        map[string]string{"TIMEWINDOW_VERSION": "true"},
+			wantCode:   exitAllowed,
+			wantStdout: "",
+		},
+		{
 			name:       "an unknown flag is an error",
 			args:       []string{"-nope"},
 			wantCode:   exitError,
@@ -615,7 +714,7 @@ func TestRun(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 
-			code := run(tc.args, &stdout, &stderr)
+			code := run(tc.args, envFrom(tc.env), &stdout, &stderr)
 
 			if code != tc.wantCode {
 				t.Errorf("run() = %d, want %d (stderr: %s)", code, tc.wantCode, stderr.String())
@@ -636,7 +735,7 @@ func TestRun(t *testing.T) {
 func TestRunVersion(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
-	if code := run([]string{"-version"}, &stdout, &stderr); code != exitAllowed {
+	if code := run([]string{"-version"}, envFrom(nil), &stdout, &stderr); code != exitAllowed {
 		t.Errorf("run(-version) = %d, want %d", code, exitAllowed)
 	}
 	if !strings.HasPrefix(stdout.String(), "timewindow ") {
@@ -752,4 +851,59 @@ func TestBuildInfoString(t *testing.T) {
 			t.Errorf("String() = %q, want it to contain %q", got, want)
 		}
 	}
+}
+
+func TestApplyEnv(t *testing.T) {
+	newFlags := func() (*flag.FlagSet, *string) {
+		flags := flag.NewFlagSet("test", flag.ContinueOnError)
+		flags.SetOutput(io.Discard)
+		value := flags.String("format", "none", "")
+		return flags, value
+	}
+
+	t.Run("fills in a flag that was not given", func(t *testing.T) {
+		flags, format := newFlags()
+		if err := flags.Parse(nil); err != nil {
+			t.Fatalf("Parse() error = %v", err)
+		}
+		if err := applyEnv(flags, envFrom(map[string]string{"TIMEWINDOW_FORMAT": "json"})); err != nil {
+			t.Fatalf("applyEnv() error = %v", err)
+		}
+		if *format != "json" {
+			t.Errorf("format = %q, want %q", *format, "json")
+		}
+	})
+
+	t.Run("leaves a flag that was given", func(t *testing.T) {
+		flags, format := newFlags()
+		if err := flags.Parse([]string{"-format", "text"}); err != nil {
+			t.Fatalf("Parse() error = %v", err)
+		}
+		if err := applyEnv(flags, envFrom(map[string]string{"TIMEWINDOW_FORMAT": "json"})); err != nil {
+			t.Fatalf("applyEnv() error = %v", err)
+		}
+		if *format != "text" {
+			t.Errorf("format = %q, want the flag value %q", *format, "text")
+		}
+	})
+
+	t.Run("an empty variable is still a value", func(t *testing.T) {
+		flags, format := newFlags()
+		if err := flags.Parse(nil); err != nil {
+			t.Fatalf("Parse() error = %v", err)
+		}
+		if err := applyEnv(flags, envFrom(map[string]string{"TIMEWINDOW_FORMAT": ""})); err != nil {
+			t.Fatalf("applyEnv() error = %v", err)
+		}
+		if *format != "" {
+			t.Errorf("format = %q, want it emptied by the variable", *format)
+		}
+	})
+
+	t.Run("no lookup is not an error", func(t *testing.T) {
+		flags, _ := newFlags()
+		if err := applyEnv(flags, nil); err != nil {
+			t.Errorf("applyEnv(nil) error = %v", err)
+		}
+	})
 }

@@ -5,11 +5,11 @@ policy of time-based rules?** It reports the answer on stdout and in its exit
 status, so a shell, a Makefile, a cron job or a CI step can gate on it.
 
 ```console
-$ timewindow
-allowed=false
-reason=friday-afternoon
+$ timewindow            # silent: the exit status is the answer
 $ echo $?
 1
+$ timewindow -format text
+denied (friday-afternoon)
 ```
 
 Policy is a list of **rules**, evaluated like firewall rules: top to bottom,
@@ -110,29 +110,32 @@ matched against local wall-clock time across DST switches.
 ## Usage
 
 ```
-timewindow [-config path] [-at time] [-format key-value|json] [-quiet] [-version]
+timewindow [-config path] [-at time] [-format none|key-value|json|text] [-version]
 ```
 
-| Flag | Meaning |
-| --- | --- |
-| `-config` | Policy file. Default `timewindow.yml`; `-` reads stdin. |
-| `-at` | Evaluate an RFC 3339 instant instead of now — handy for asking "what will this policy say on Christmas Eve?". |
-| `-format` | `key-value` (default) or `json`. |
-| `-quiet` | Print nothing; answer with the exit status alone. |
+| Flag | Environment | Meaning |
+| --- | --- | --- |
+| `-config` | `TIMEWINDOW_CONFIG` | Policy file. Default `timewindow.yml`; `-` reads stdin. |
+| `-at` | `TIMEWINDOW_AT` | Evaluate an RFC 3339 instant instead of now — handy for asking "what will this policy say on Christmas Eve?". |
+| `-format` | `TIMEWINDOW_FORMAT` | What to print. Default `none`. |
+| `-version` | — | Print version information and exit. |
 
-The decision is reported twice, so callers can take whichever is convenient.
-On stdout:
+Every flag except `-version` can also be set with the environment variable
+beside it, so the same binary can be configured by a shell profile, a
+container, or a CI job's `env:` block. A flag always wins over its variable:
 
-```console
-$ timewindow -at 2026-12-24T10:00:00+01:00
-allowed=false
-reason=christmas-freeze
+```sh
+export TIMEWINDOW_CONFIG=/etc/timewindow.yml
+export TIMEWINDOW_FORMAT=text
 
-$ timewindow -at 2026-12-24T10:00:00+01:00 -format json
-{"allowed":false,"reason":"christmas-freeze"}
+timewindow                  # uses both variables
+timewindow -format json     # the flag wins
 ```
 
-...and in the exit status:
+### Output
+
+**Nothing is printed unless you ask for it.** The decision is always in the
+exit status, and most callers only branch on that:
 
 | Code | Meaning |
 | --- | --- |
@@ -143,8 +146,25 @@ $ timewindow -at 2026-12-24T10:00:00+01:00 -format json
 Which makes it a plain shell predicate:
 
 ```sh
-timewindow -quiet && ./release.sh
+timewindow && ./release.sh
 ```
+
+When you do want the decision written out, pick a format:
+
+```console
+$ timewindow -at 2026-12-24T10:00:00+01:00 -format text
+denied (christmas-freeze)
+
+$ timewindow -at 2026-12-24T10:00:00+01:00 -format key-value
+allowed=false
+reason=christmas-freeze
+
+$ timewindow -at 2026-12-24T10:00:00+01:00 -format json
+{"allowed":false,"reason":"christmas-freeze"}
+```
+
+`none` is the default and prints nothing; `key-value` suits `$GITHUB_OUTPUT`
+and shell `eval`; `json` suits anything that parses; `text` is for a person.
 
 The `reason` is the name of the rule that decided, or `no rule matched` when
 the policy fell through to its default.
@@ -211,7 +231,7 @@ status, so it composes wherever that works.
 **A shell script:**
 
 ```sh
-timewindow -quiet || { echo "outside the window, skipping"; exit 0; }
+timewindow || { echo "outside the window, skipping"; exit 0; }
 ./release.sh
 ```
 
@@ -219,33 +239,32 @@ timewindow -quiet || { echo "outside the window, skipping"; exit 0; }
 
 ```make
 deploy:
-	@timewindow -quiet || { echo "outside the deploy window"; exit 1; }
+	@timewindow || { echo "outside the deploy window"; exit 1; }
 	./deploy.sh
 ```
 
 **cron**, to run a job hourly but only while the policy allows it:
 
 ```cron
-0 * * * * timewindow -quiet -config /etc/timewindow.yml && /usr/local/bin/run-batch
+0 * * * * TIMEWINDOW_CONFIG=/etc/timewindow.yml timewindow && /usr/local/bin/run-batch
 ```
 
 **A one-off question**, without touching a file at all:
 
 ```console
-$ timewindow -config - -at 2026-12-24T10:00:00+01:00 <<'EOF'
+$ timewindow -config - -at 2026-12-24T10:00:00+01:00 -format text <<'EOF'
 rules:
   - name: christmas-freeze
     action: deny
     time_intervals: [{ months: ['december'], days_of_month: ['22:31'] }]
 EOF
-allowed=false
-reason=christmas-freeze
+denied (christmas-freeze)
 ```
 
 ### GitHub Actions
 
-The `key=value` output is the format `$GITHUB_OUTPUT` wants, so a step can
-append to it directly:
+The `key-value` format is what `$GITHUB_OUTPUT` wants, so a step can append to
+it directly. Setting it through the environment keeps the step itself plain:
 
 ```yaml
 - name: Install timewindow
@@ -253,6 +272,8 @@ append to it directly:
     curl -sSfL https://github.com/maartenvanvliet/timewindow/releases/download/v1.0.0/timewindow_linux_amd64.tar.gz \
       | tar xz timewindow
 - id: check
+  env:
+    TIMEWINDOW_FORMAT: key-value
   run: |
     set +e
     ./timewindow >> "$GITHUB_OUTPUT"
@@ -287,13 +308,13 @@ workflow run:
       exit 0
     fi
     set +e
-    ./timewindow >> "$GITHUB_OUTPUT"
+    ./timewindow -format key-value >> "$GITHUB_OUTPUT"
     code=$?
     [ "$code" -le 1 ] || exit "$code"
 ```
 
-In a repo that vendors this tool, `go run . >> "$GITHUB_OUTPUT"` works too, but
-it cannot tell "correctly skipped" from "broken policy" — `go run` reports
+In a repo that vendors this tool, `go run . -format key-value >> "$GITHUB_OUTPUT"`
+works too, but it cannot tell "correctly skipped" from "broken policy" — `go run` reports
 every non-zero program exit as `1`. Use the released binary, or `go build`
 first, when you need the exit codes intact.
 
@@ -348,8 +369,9 @@ nested `action`.
 
 `run` is the entire CLI, so the argument handling is tested the way a caller
 sees it: arguments in, stdout/stderr and an exit code out. That table covers
-both output formats, `-quiet`, a bad `-at` and `-format`, an unknown flag, and
-that `-h` is not an error. A third table covers the version stamping: link time
+every output format, configuration through the environment and a flag winning
+over its variable, a bad `-at` and `-format`, an unknown flag, and that `-h` is
+not an error. A third table covers the version stamping: link time
 values winning over the toolchain's, a `go install` build describing itself
 from the VCS stamps, and a dirty tree being flagged.
 
